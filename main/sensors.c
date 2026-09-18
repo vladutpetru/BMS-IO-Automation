@@ -66,6 +66,24 @@ static uint8_t DHT_read_byte(gpio_num_t pin) {
 	return data;
 }
 
+int read_temperature_tenths_c(adc1_channel_t channel)
+{
+    /* 12-bit ADC (0-4095), ADC_ATTEN_DB_11 gives ~0-3.9V full scale on ESP32 */
+    int raw = adc1_get_raw(channel);
+    if (raw < 0)
+    {
+        ESP_LOGE("SENSORS", "adc1_get_raw failed for channel %d", channel);
+        return 0;
+    }
+
+    float voltage = ((float)raw / 4095.0f) * 3.9f;
+
+    /* TMP36-style linear sensor: Vout = 0.5V + 10mV per degC */
+    float temp_c = (voltage - 0.5f) * 100.0f;
+
+    return (int)(temp_c * 10.0f);
+}
+
 uint8_t DHT_read(DHT22_TypeDef *dht11, gpio_num_t pin) {
 
 	if (DHT_start(pin)) {
