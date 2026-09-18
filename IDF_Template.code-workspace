@@ -1,0 +1,96 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"terminal.integrated.profiles.windows": {
+			"idf": {
+				"path": "cmd.exe",
+				"args": [
+					"/k",
+					"%IDF_TOOLS_PATH%/frameworks/esp-idf-v5.0/export.bat"
+				]
+			}
+			},
+			"terminal.integrated.defaultProfile.windows": "idf",
+			"actionButtons": {
+				"commands": [
+					{
+						"name": "Build",
+						"color": "Black",
+						"command": "idf.py build"
+					},
+					{
+						"name": "Run",
+						"color": "Black",
+						"command": "idf.py flash -p COM5"
+					},
+					{
+						"name": "MenuConfig",
+						"color": "Black",
+						"command": "start idf.py menuconfig"
+					},
+					{
+						"name": "Monitor",
+						"color": "Black",
+						"command": "idf.py monitor -p COM5"
+					}
+				]
+			},
+			"files.associations": {
+				"stdio.h": "c",
+				"reent.h": "c",
+				"esp_intr_alloc.h": "c",
+				"sdkconfig.h": "c",
+				"freertos.h": "c",
+				"esp_wifi.h": "c",
+				"nvs_flash.h": "c",
+				"esp_system.h": "c",
+				"esp_wifi_types.h": "c",
+				"esp_event.h": "c",
+				"global.h": "c",
+				"thread": "c",
+				"esp_netif.h": "c",
+				"param.h": "c",
+				"esp_log.h": "c",
+				"ratio": "c",
+				"buffer": "c",
+				"array": "c",
+				"bitset": "c",
+				"internet": "c",
+				"socket": "c",
+				"string_view": "c",
+				"initializer_list": "c",
+				"regex": "c",
+				"utility": "c",
+				"string.h": "c",
+				"global_variables.h": "c",
+				"*.tcc": "c",
+				"executor": "c",
+				"memory": "c",
+				"future": "c",
+				"istream": "c",
+				"functional": "c",
+				"tuple": "c",
+				"variant": "c",
+				"esp_spiffs.h": "c",
+				"cstdio": "c",
+				"string": "c",
+				"numbers": "c",
+				"my_application.h": "c",
+				"*.inc": "c",
+				"esp_timer.h": "c",
+				"algorithm": "c",
+				"random": "c",
+				"fstream": "c",
+				"iosfwd": "c",
+				"iostream": "c",
+				"numeric": "c",
+				"ostream": "c",
+				"sstream": "c",
+				"streambuf": "c"
+			}
+	}
+}
