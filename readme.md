@@ -5,8 +5,9 @@ This project builds firmware for an ESP32 using ESP-IDF (not Arduino framework).
 
 ## Hardware
 - MCU: ESP32 (specify exact variant, e.g. ESP32-WROOM-32, if relevant)
-- Temperature sensor: to be defined
-- Output/controllable pin(s): to be defined
+- Temperature sensor: Analog temperature, GPIO36
+- UART: GPIO17 (TX) / GPIO16 (RX) → UART2 for serial.
+- Output/controllable pin(s): GPIO4, GPIO18, GPIO19, GPIO21
 
 ## Software stack
 - Framework: ESP-IDF (target version: e.g. v5.x)
