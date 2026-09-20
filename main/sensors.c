@@ -1,6 +1,5 @@
 #include "sensors.h"
 #include "stdio.h"
-#include "utils.h"
 #include "esp_log.h"
 
 static int Dht_Delay(uint32_t timeout, char state, gpio_num_t pin)

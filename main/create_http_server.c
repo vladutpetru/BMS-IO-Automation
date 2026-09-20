@@ -10,8 +10,8 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "global_variables.h"
+#include "app_nvs.h"
 #include <stdio.h>
-#include "utils.h"
 
 static const char *TAG = "HTTP_Server";
 

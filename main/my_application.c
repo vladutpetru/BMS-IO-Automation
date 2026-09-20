@@ -2,7 +2,6 @@
 #include "freertos/task.h"
 #include "global_variables.h"
 #include "freertos/timers.h"
-#include "utils.h"
 #include "esp_log.h"
 #include "sensors.h"
 #include "my_application.h"

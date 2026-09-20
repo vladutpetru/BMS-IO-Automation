@@ -8,7 +8,7 @@
 #include "esp_netif_ip_addr.h"
 #include "esp_netif.h"
 #include "lwip/ip_addr.h"
-#include "utils.h"
+#include "app_nvs.h"
 
 #define EXAMPLE_ESP_MAXIMUM_RETRY  CONFIG_ESP_MAXIMUM_RETRY
 esp_netif_t *ap_netif = NULL;

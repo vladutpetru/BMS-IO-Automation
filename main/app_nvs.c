@@ -1,7 +1,7 @@
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "utils.h"
+#include "app_nvs.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -27,34 +27,34 @@ esp_err_t NVS_Write(const char* key, nvs_value_type_t type, const void* value, s
 
     switch (type)
     {
-        case NVS_TYPE_STRING:
+        case APP_NVS_STRING:
             retVal = nvs_set_str(nvsHandle, key, (const char*)value);
             break;
-        case NVS_TYPE_U8:
+        case APP_NVS_U8:
             retVal = nvs_set_u8(nvsHandle, key, *(const uint8_t*)value);
             break;
-        case NVS_TYPE_I8:
+        case APP_NVS_I8:
             retVal = nvs_set_i8(nvsHandle, key, *(const int8_t*)value);
             break;
-        case NVS_TYPE_U16:
+        case APP_NVS_U16:
             retVal = nvs_set_u16(nvsHandle, key, *(const uint16_t*)value);
             break;
-        case NVS_TYPE_I16:
+        case APP_NVS_I16:
             retVal = nvs_set_i16(nvsHandle, key, *(const int16_t*)value);
             break;
-        case NVS_TYPE_U32:
+        case APP_NVS_U32:
             retVal = nvs_set_u32(nvsHandle, key, *(const uint32_t*)value);
             break;
-        case NVS_TYPE_I32:
+        case APP_NVS_I32:
             retVal = nvs_set_i32(nvsHandle, key, *(const int32_t*)value);
             break;
-        case NVS_TYPE_U64:
+        case APP_NVS_U64:
             retVal = nvs_set_u64(nvsHandle, key, *(const uint64_t*)value);
             break;
-        case NVS_TYPE_I64:
+        case APP_NVS_I64:
             retVal = nvs_set_i64(nvsHandle, key, *(const int64_t*)value);
             break;
-        case NVS_TYPE_BLOB:
+        case APP_NVS_BLOB:
             retVal = nvs_set_blob(nvsHandle, key, value, len);
             break;
         default:
@@ -94,7 +94,7 @@ esp_err_t NVS_Read(const char* key, nvs_value_type_t type, void* value, size_t* 
         ESP_LOGE(NVS_TAG, "NVS_Read called with NULL key or value");
         return ESP_ERR_INVALID_ARG;
     }
-    if ((type == NVS_TYPE_STRING || type == NVS_TYPE_BLOB) && len == NULL)
+    if ((type == APP_NVS_STRING || type == APP_NVS_BLOB) && len == NULL)
     {
         ESP_LOGE(NVS_TAG, "NVS_Read: string/blob type requires a non-NULL len pointer (key '%s')", key);
         return ESP_ERR_INVALID_ARG;
@@ -109,34 +109,34 @@ esp_err_t NVS_Read(const char* key, nvs_value_type_t type, void* value, size_t* 
 
     switch (type)
     {
-        case NVS_TYPE_STRING:
+        case APP_NVS_STRING:
             retVal = nvs_get_str(nvsHandle, key, (char*)value, len);
             break;
-        case NVS_TYPE_U8:
+        case APP_NVS_U8:
             retVal = nvs_get_u8(nvsHandle, key, (uint8_t*)value);
             break;
-        case NVS_TYPE_I8:
+        case APP_NVS_I8:
             retVal = nvs_get_i8(nvsHandle, key, (int8_t*)value);
             break;
-        case NVS_TYPE_U16:
+        case APP_NVS_U16:
             retVal = nvs_get_u16(nvsHandle, key, (uint16_t*)value);
             break;
-        case NVS_TYPE_I16:
+        case APP_NVS_I16:
             retVal = nvs_get_i16(nvsHandle, key, (int16_t*)value);
             break;
-        case NVS_TYPE_U32:
+        case APP_NVS_U32:
             retVal = nvs_get_u32(nvsHandle, key, (uint32_t*)value);
             break;
-        case NVS_TYPE_I32:
+        case APP_NVS_I32:
             retVal = nvs_get_i32(nvsHandle, key, (int32_t*)value);
             break;
-        case NVS_TYPE_U64:
+        case APP_NVS_U64:
             retVal = nvs_get_u64(nvsHandle, key, (uint64_t*)value);
             break;
-        case NVS_TYPE_I64:
+        case APP_NVS_I64:
             retVal = nvs_get_i64(nvsHandle, key, (int64_t*)value);
             break;
-        case NVS_TYPE_BLOB:
+        case APP_NVS_BLOB:
             retVal = nvs_get_blob(nvsHandle, key, value, len);
             break;
         default:
@@ -167,21 +167,21 @@ esp_err_t NVS_Read(const char* key, nvs_value_type_t type, void* value, size_t* 
 void NVS_Write_String(const char* key, const char* stringVal)
 {
     /* Original signature is void; callers that need the result should switch to NVS_Write() directly. */
-    (void)NVS_Write(key, NVS_TYPE_STRING, stringVal, 0);
+    (void)NVS_Write(key, APP_NVS_STRING, stringVal, 0);
 }
 
 esp_err_t NVS_Read_String(const char* key, char* value, char max_len)
 {
     size_t len = (size_t)max_len;
-    return NVS_Read(key, NVS_TYPE_STRING, value, &len);
+    return NVS_Read(key, APP_NVS_STRING, value, &len);
 }
 
 esp_err_t NVS_Write_U32(const char* key, uint32_t value)
 {
-    return NVS_Write(key, NVS_TYPE_U32, &value, sizeof(value));
+    return NVS_Write(key, APP_NVS_U32, &value, sizeof(value));
 }
 
 esp_err_t NVS_Read_U32(const char* key, uint32_t* value)
 {
-    return NVS_Read(key, NVS_TYPE_U32, value, NULL);
+    return NVS_Read(key, APP_NVS_U32, value, NULL);
 }

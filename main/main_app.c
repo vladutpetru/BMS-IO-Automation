@@ -14,7 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "nvs_flash.h"
 #include "global.h"
-#include "utils.h"
+#include "app_nvs.h"
 #include "my_application.h"
 
 wifi_ap_record_t ap_info[DEFAULT_SCAN_LIST_SIZE];
