@@ -1,4 +1,5 @@
 idf_component_register(SRCS "main_app.c"
+                            "wifi_ap.c"
                             "create_http_server.c"
                             "app_nvs.c"
                             "app_state.c"

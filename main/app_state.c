@@ -4,6 +4,7 @@
 #include "freertos/semphr.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include "app_nvs.h"
 #include "app_state.h"
 

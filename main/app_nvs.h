@@ -1,3 +1,11 @@
+#ifndef APP_NVS_H
+#define APP_NVS_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "esp_err.h"
+#include "nvs.h"        /* ESP_ERR_NVS_NOT_FOUND and the other NVS error codes */
+
 typedef enum {
     APP_NVS_STRING = 0,
     APP_NVS_U8,
@@ -35,3 +43,5 @@ esp_err_t NVS_Read_String(const char* key, char* value, char max_len);
 
 esp_err_t NVS_Write_U32(const char* key, uint32_t value);
 esp_err_t NVS_Read_U32(const char* key, uint32_t* value);
+
+#endif /* APP_NVS_H */

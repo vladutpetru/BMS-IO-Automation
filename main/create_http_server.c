@@ -9,7 +9,7 @@
 #include "esp_spiffs.h"
 #include "esp_http_server.h"
 #include "cJSON.h"
-#include "global.h"
+#include "create_http_server.h"
 #include "app_state.h"
 
 static const char *TAG = "HTTP_Server";
@@ -447,7 +447,7 @@ void http_server(void)
         ESP_LOGE(TAG, "Web UI will not be served; the JSON API stays available");
     }
 
-    /* Listens on all interfaces, so it works in both AP and STA mode */
+    /* Listens on the AP interface (192.168.4.1 by default) */
     esp_err_t err = start_webserver();
     if (err != ESP_OK)
     {
