@@ -23,9 +23,9 @@
 						"command": "idf.py build"
 					},
 					{
-						"name": "Run",
+						"name": "Flash",
 						"color": "Black",
-						"command": "idf.py flash -p COM5"
+						"command": "idf.py flash -p COM4"
 					},
 					{
 						"name": "MenuConfig",
@@ -35,7 +35,12 @@
 					{
 						"name": "Monitor",
 						"color": "Black",
-						"command": "idf.py monitor -p COM5"
+						"command": "idf.py monitor -p COM4"
+					},
+										{
+						"name": "FullClean",
+						"color": "Black",
+						"command": "idf.py fullclean"
 					}
 				]
 			},

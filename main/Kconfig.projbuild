@@ -1,0 +1,25 @@
+menu "BMS IO Automation"
+
+    config APP_WIFI_AP_SSID
+        string "Wi-Fi AP SSID"
+        default "AP_BMS_IO"
+        help
+            Name of the access point the ESP32 creates. 1-32 characters.
+
+    config APP_WIFI_AP_PASSWORD
+        string "Wi-Fi AP password"
+        default "12345678"
+        help
+            WPA2 password, 8-63 characters. Leave empty for an open network.
+
+    config APP_WIFI_AP_CHANNEL
+        int "Wi-Fi AP channel"
+        range 1 13
+        default 1
+
+    config APP_WIFI_AP_MAX_CONN
+        int "Maximum connected stations"
+        range 1 10
+        default 1
+
+endmenu
