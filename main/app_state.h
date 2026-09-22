@@ -13,7 +13,7 @@
 /* Boiling chapter: max temperature in tenths of degC (0.0 .. 125.0 degC) */
 #define APP_BOIL_MAX_MIN_TENTHS     0
 #define APP_BOIL_MAX_MAX_TENTHS     1250
-#define APP_BOIL_MAX_DEFAULT_TENTHS 1000
+#define APP_BOIL_MAX_DEFAULT_TENTHS 800     /* 80.0 degC */
 
 typedef struct
 {
