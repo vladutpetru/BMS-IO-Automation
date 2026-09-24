@@ -2,7 +2,6 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/stat.h>
 #include "esp_err.h"
 #include "esp_log.h"
@@ -117,6 +116,40 @@ static esp_err_t read_json_body(httpd_req_t *req, cJSON **out)
     return ESP_OK;
 }
 
+/* Reads whole-number "min"/"max" from root and checks lo <= min,max <= hi and max > min.
+ * Returns false with a message in msg on failure. Does not free root. */
+static bool parse_min_max(const cJSON *root, int lo, int hi, int *min, int *max, char *msg, size_t msg_len)
+{
+    const cJSON *min_item = cJSON_GetObjectItemCaseSensitive(root, "min");
+    const cJSON *max_item = cJSON_GetObjectItemCaseSensitive(root, "max");
+    if (!cJSON_IsNumber(min_item) || !cJSON_IsNumber(max_item))
+    {
+        snprintf(msg, msg_len, "Body needs numeric \"min\" and \"max\"");
+        return false;
+    }
+    double min_d = min_item->valuedouble;
+    double max_d = max_item->valuedouble;
+
+    if (min_d != floor(min_d) || max_d != floor(max_d))
+    {
+        snprintf(msg, msg_len, "\"min\" and \"max\" must be whole numbers");
+        return false;
+    }
+    if (min_d < lo || min_d > hi || max_d < lo || max_d > hi)
+    {
+        snprintf(msg, msg_len, "\"min\" and \"max\" must be between %d and %d", lo, hi);
+        return false;
+    }
+    if (max_d <= min_d)
+    {
+        snprintf(msg, msg_len, "\"max\" must be greater than \"min\"");
+        return false;
+    }
+    *min = (int)min_d;
+    *max = (int)max_d;
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* GET / and /index.html - streamed from SPIFFS in 1 KB chunks          */
 /* ------------------------------------------------------------------ */
@@ -175,7 +208,7 @@ static esp_err_t temperature_get_handler(httpd_req_t *req)
     int tenths;
     if (!app_state_get_temp_tenths(&tenths))
     {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No temperature reading yet");
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No temperature reading");
     }
     char json[32];
     snprintf(json, sizeof(json), "{\"temp_c\":%.1f}", tenths / 10.0);
@@ -184,16 +217,28 @@ static esp_err_t temperature_get_handler(httpd_req_t *req)
 
 /* ------------------------------------------------------------------ */
 /* GET /api/settings                                                   */
-/* {"boil_max_c":100,"triggers":[{"id":0,"name":"Trigger 1","min":20,"max":100},..]} */
+/* {"boiler":{"min":70,"max":80},                                      */
+/*  "triggers":[{"id":0,"name":"Trigger 1","min":20,"max":100},..]}    */
 /* ------------------------------------------------------------------ */
 
 static esp_err_t settings_get_handler(httpd_req_t *req)
 {
+    app_trigger_t boil;
+    esp_err_t err = app_state_get_boil(&boil);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Reading boiler min/max failed (%s)", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read settings");
+    }
+
     cJSON *root = cJSON_CreateObject();
+    cJSON *boiler = NULL;
     cJSON *triggers = NULL;
 
     if (root == NULL ||
-        cJSON_AddNumberToObject(root, "boil_max_c", app_state_get_boil_max_tenths() / 10.0) == NULL ||
+        (boiler = cJSON_AddObjectToObject(root, "boiler")) == NULL ||
+        cJSON_AddNumberToObject(boiler, "min", boil.min) == NULL ||
+        cJSON_AddNumberToObject(boiler, "max", boil.max) == NULL ||
         (triggers = cJSON_AddArrayToObject(root, "triggers")) == NULL)
     {
         goto oom;
@@ -202,7 +247,7 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     for (int i = 0; i < APP_TRIGGER_COUNT; i++)
     {
         app_trigger_t t;
-        esp_err_t err = app_state_get_trigger(i, &t);
+        err = app_state_get_trigger(i, &t);
         if (err != ESP_OK)
         {
             ESP_LOGE(TAG, "Reading trigger %d failed (%s)", i, esp_err_to_name(err));
@@ -236,7 +281,8 @@ oom:
 }
 
 /* ------------------------------------------------------------------ */
-/* POST /api/boil   body {"boil_max_c": 98.5}                           */
+/* POST /api/boil   body {"min": 70, "max": 80}                         */
+/* Rules: whole numbers, 0 <= min/max <= 80, max > min                 */
 /* ------------------------------------------------------------------ */
 
 static esp_err_t boil_post_handler(httpd_req_t *req)
@@ -247,41 +293,33 @@ static esp_err_t boil_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "boil_max_c");
-    if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble))
-    {
-        cJSON_Delete(root);
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "\"boil_max_c\" must be a number");
-    }
-    double celsius = item->valuedouble;
+    int min, max;
+    char msg[64];
+    bool ok = parse_min_max(root, APP_BOIL_LIMIT_MIN, APP_BOIL_LIMIT_MAX, &min, &max, msg, sizeof(msg));
     cJSON_Delete(root);
-
-    if (celsius < APP_BOIL_MAX_MIN_TENTHS / 10.0 || celsius > APP_BOIL_MAX_MAX_TENTHS / 10.0)
+    if (!ok)
     {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "\"boil_max_c\" must be between %.1f and %.1f",
-                 APP_BOIL_MAX_MIN_TENTHS / 10.0, APP_BOIL_MAX_MAX_TENTHS / 10.0);
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
     }
 
-    esp_err_t err = app_state_set_boil_max_tenths((int)lround(celsius * 10.0));
+    esp_err_t err = app_state_set_boil(min, max);
     if (err == ESP_ERR_INVALID_ARG)
     {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Value out of range");
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid min/max");
     }
     if (err != ESP_OK)
     {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save to flash");
     }
 
-    char json[40];
-    snprintf(json, sizeof(json), "{\"boil_max_c\":%.1f}", app_state_get_boil_max_tenths() / 10.0);
+    char json[32];
+    snprintf(json, sizeof(json), "{\"min\":%d,\"max\":%d}", min, max);
     return send_json(req, json);
 }
 
 /* ------------------------------------------------------------------ */
 /* POST /api/trigger  body {"id": 0, "min": 30, "max": 80}              */
-/* Rules: whole numbers, 20 <= min/max <= 100, max > min               */
+/* Rules: whole numbers, 0 <= min/max <= 100, max > min                */
 /* ------------------------------------------------------------------ */
 
 static esp_err_t trigger_post_handler(httpd_req_t *req)
@@ -292,43 +330,29 @@ static esp_err_t trigger_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    const cJSON *id_item  = cJSON_GetObjectItemCaseSensitive(root, "id");
-    const cJSON *min_item = cJSON_GetObjectItemCaseSensitive(root, "min");
-    const cJSON *max_item = cJSON_GetObjectItemCaseSensitive(root, "max");
-    if (!cJSON_IsNumber(id_item) || !cJSON_IsNumber(min_item) || !cJSON_IsNumber(max_item))
+    const cJSON *id_item = cJSON_GetObjectItemCaseSensitive(root, "id");
+    if (!cJSON_IsNumber(id_item))
     {
         cJSON_Delete(root);
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body needs numeric \"id\", \"min\" and \"max\"");
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body needs numeric \"id\"");
     }
-    double id_d  = id_item->valuedouble;
-    double min_d = min_item->valuedouble;
-    double max_d = max_item->valuedouble;
+    double id_d = id_item->valuedouble;
+
+    int min, max;
+    char msg[64];
+    bool ok = parse_min_max(root, APP_TRIGGER_LIMIT_MIN, APP_TRIGGER_LIMIT_MAX, &min, &max, msg, sizeof(msg));
     cJSON_Delete(root);
 
     if (id_d != floor(id_d) || id_d < 0 || id_d >= APP_TRIGGER_COUNT)
     {
         return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Unknown trigger id");
     }
-    if (min_d != floor(min_d) || max_d != floor(max_d))
+    if (!ok)
     {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "\"min\" and \"max\" must be whole numbers");
-    }
-    if (min_d < APP_TRIGGER_LIMIT_MIN || min_d > APP_TRIGGER_LIMIT_MAX ||
-        max_d < APP_TRIGGER_LIMIT_MIN || max_d > APP_TRIGGER_LIMIT_MAX)
-    {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "\"min\" and \"max\" must be between %d and %d",
-                 APP_TRIGGER_LIMIT_MIN, APP_TRIGGER_LIMIT_MAX);
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
-    }
-    if (max_d <= min_d)
-    {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "\"max\" must be greater than \"min\"");
     }
 
     int id = (int)id_d;
-    int min = (int)min_d;
-    int max = (int)max_d;
     esp_err_t err = app_state_set_trigger(id, min, max);
     if (err == ESP_ERR_NOT_FOUND)
     {

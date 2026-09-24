@@ -1,11 +1,12 @@
-#include "nvs_flash.h"
-#include "esp_log.h"
-#include "esp_timer.h"
-#include "app_nvs.h"
 #include <stdint.h>
-#include <string.h>
+#include <stddef.h>
+#include "nvs.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "app_nvs.h"
 
 static const char *NVS_TAG = "NVS";
+#define NVS_NAMESPACE "STORAGE"
 
 esp_err_t NVS_Write(const char* key, nvs_value_type_t type, const void* value, size_t len)
 {
@@ -18,7 +19,7 @@ esp_err_t NVS_Write(const char* key, nvs_value_type_t type, const void* value, s
         return ESP_ERR_INVALID_ARG;
     }
 
-    retVal = nvs_open("STORAGE", NVS_READWRITE, &nvsHandle);
+    retVal = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvsHandle);
     if (retVal != ESP_OK)
     {
         ESP_LOGE(NVS_TAG, "Error (%s) opening NVS handle for Write (key '%s')", esp_err_to_name(retVal), key);
@@ -100,7 +101,15 @@ esp_err_t NVS_Read(const char* key, nvs_value_type_t type, void* value, size_t* 
         return ESP_ERR_INVALID_ARG;
     }
 
-    retVal = nvs_open("STORAGE", NVS_READWRITE, &nvsHandle);
+    /* Read-only: a read never needs write access. On a fresh chip the namespace does not
+     * exist yet and nvs_open returns ESP_ERR_NVS_NOT_FOUND, which callers treat like a
+     * missing key (they write the default, which creates the namespace). */
+    retVal = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvsHandle);
+    if (retVal == ESP_ERR_NVS_NOT_FOUND)
+    {
+        ESP_LOGW(NVS_TAG, "Namespace '%s' not created yet (key '%s')", NVS_NAMESPACE, key);
+        return retVal;
+    }
     if (retVal != ESP_OK)
     {
         ESP_LOGE(NVS_TAG, "Error (%s) opening NVS handle for Read (key '%s')", esp_err_to_name(retVal), key);
@@ -160,28 +169,4 @@ esp_err_t NVS_Read(const char* key, nvs_value_type_t type, void* value, size_t* 
 
     nvs_close(nvsHandle);
     return retVal;
-}
-
-/* --- Typed convenience wrappers, kept for existing call sites --- */
-
-void NVS_Write_String(const char* key, const char* stringVal)
-{
-    /* Original signature is void; callers that need the result should switch to NVS_Write() directly. */
-    (void)NVS_Write(key, APP_NVS_STRING, stringVal, 0);
-}
-
-esp_err_t NVS_Read_String(const char* key, char* value, char max_len)
-{
-    size_t len = (size_t)max_len;
-    return NVS_Read(key, APP_NVS_STRING, value, &len);
-}
-
-esp_err_t NVS_Write_U32(const char* key, uint32_t value)
-{
-    return NVS_Write(key, APP_NVS_U32, &value, sizeof(value));
-}
-
-esp_err_t NVS_Read_U32(const char* key, uint32_t* value)
-{
-    return NVS_Read(key, APP_NVS_U32, value, NULL);
 }

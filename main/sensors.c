@@ -1,103 +1,130 @@
-#include <stdio.h>
+#include <stdint.h>
+#include "sdkconfig.h"
+#include "esp_err.h"
 #include "esp_log.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "sensors.h"
 
-static int Dht_Delay(uint32_t timeout, char state, gpio_num_t pin)
+static const char *TAG = "SENSORS";
+
+/* Nominal ESP32 ADC reference, used only if the chip has no calibration in eFuse */
+#define DEFAULT_VREF_MV 1100
+
+static adc_oneshot_unit_handle_t s_adc  = NULL;
+static adc_cali_handle_t         s_cali = NULL;
+
+esp_err_t sensors_init(void)
 {
-    int uSec = 0;
-    while (gpio_get_level(pin) == state)
+    if (s_adc != NULL)
     {
-        if (uSec > timeout)
-            return -1;
-
-        ++uSec;
-        esp_rom_delay_us(1); // uSec delay
+        return ESP_OK;
     }
-    return uSec;
-}
 
-static uint8_t DHT_start(gpio_num_t pin)
-{
-    int res;
-    /* Config PIN output */
-    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+    const adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = TEMP_SENSOR_ADC_UNIT,
+    };
+    esp_err_t err = adc_oneshot_new_unit(&unit_cfg, &s_adc);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "adc_oneshot_new_unit failed (%s)", esp_err_to_name(err));
+        s_adc = NULL;
+        return err;
+    }
 
-    /* Put line to low */
-    gpio_set_level(pin, 0);
+    const adc_oneshot_chan_cfg_t chan_cfg = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = TEMP_SENSOR_ADC_ATTEN,
+    };
+    err = adc_oneshot_config_channel(s_adc, TEMP_SENSOR_ADC_CHANNEL, &chan_cfg);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "adc_oneshot_config_channel failed (%s)", esp_err_to_name(err));
+        goto fail;
+    }
 
-    esp_rom_delay_us(3000);
+    adc_cali_line_fitting_config_t cali_cfg = {
+        .unit_id = TEMP_SENSOR_ADC_UNIT,
+        .atten = TEMP_SENSOR_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+#if CONFIG_IDF_TARGET_ESP32
+    adc_cali_line_fitting_efuse_val_t efuse = ADC_CALI_LINE_FITTING_EFUSE_VAL_DEFAULT_VREF;
+    err = adc_cali_scheme_line_fitting_check_efuse(&efuse);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Reading ADC calibration eFuse failed (%s)", esp_err_to_name(err));
+        efuse = ADC_CALI_LINE_FITTING_EFUSE_VAL_DEFAULT_VREF;
+    }
+    if (efuse == ADC_CALI_LINE_FITTING_EFUSE_VAL_DEFAULT_VREF)
+    {
+        ESP_LOGW(TAG, "No ADC calibration in eFuse - assuming Vref %d mV, readings may be off by a few degC",
+                 DEFAULT_VREF_MV);
+        cali_cfg.default_vref = DEFAULT_VREF_MV;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "ADC calibration from eFuse (%s)",
+                 efuse == ADC_CALI_LINE_FITTING_EFUSE_VAL_EFUSE_TP ? "two-point" : "Vref");
+    }
+#endif
+    err = adc_cali_create_scheme_line_fitting(&cali_cfg, &s_cali);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "adc_cali_create_scheme_line_fitting failed (%s)", esp_err_to_name(err));
+        s_cali = NULL;
+        goto fail;
+    }
 
-    /* Put line to high*/
-    gpio_set_level(pin, 1);
+    ESP_LOGI(TAG, "Temperature sensor ready: ADC1 channel %d (GPIO36), %d samples/reading, offset %d mV",
+             TEMP_SENSOR_ADC_CHANNEL, TEMP_SENSOR_SAMPLES, TEMP_SENSOR_OFFSET_MV);
+    return ESP_OK;
 
-    esp_rom_delay_us(25);
-
-    /* Config pin input */
-    gpio_set_direction(pin, GPIO_MODE_INPUT);
-
-    /* DHT will keep the line low for 80 us and then high for 80us */
-    res = Dht_Delay(85, 0, pin);
-    if (res < 0) return 0;
-
-    /* 80us up */
-    res = Dht_Delay(85, 1, pin);
-    if (res < 0) return 0;
-
-    return 1;
-}
-
-static uint8_t DHT_read_byte(gpio_num_t pin)
-{
-    uint8_t data = 0, j;
-    int res;
-
-    for (j = 0; j < 8; ++j) {
-        res = Dht_Delay(100, 0, pin);
-        esp_rom_delay_us(40);
-        if (gpio_get_level(pin) == 1) {
-            data |= (1 << (7 - j));
-            res = Dht_Delay(100, 1, pin);
+fail:
+    {
+        esp_err_t del_err = adc_oneshot_del_unit(s_adc);
+        if (del_err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "adc_oneshot_del_unit failed (%s)", esp_err_to_name(del_err));
         }
-        if (res < 0) return 0;
+        s_adc = NULL;
     }
-    return data;
+    return err;
 }
 
-int read_temperature_tenths_c(adc1_channel_t channel)
+int read_temperature_tenths_c(void)
 {
-    /* 12-bit ADC (0-4095), ADC_ATTEN_DB_11 gives ~0-3.9V full scale on ESP32 */
-    int raw = adc1_get_raw(channel);
-    if (raw < 0)
+    if (s_adc == NULL || s_cali == NULL)
     {
-        ESP_LOGE("SENSORS", "adc1_get_raw failed for channel %d", channel);
-        /* Never return a plausible temperature on error - the control loop would act on it */
         return SENSOR_TEMP_INVALID;
     }
 
-    float voltage = ((float)raw / 4095.0f) * 3.9f;
-
-    /* TMP36-style linear sensor: Vout = 0.5V + 10mV per degC */
-    float temp_c = (voltage - 0.5f) * 100.0f;
-
-    return (int)(temp_c * 10.0f);
-}
-
-uint8_t DHT_read(DHT22_TypeDef *dht11, gpio_num_t pin)
-{
-    if (DHT_start(pin)) {
-
-        uint8_t rh_b1 = DHT_read_byte(pin);
-        uint8_t rh_b2 = DHT_read_byte(pin);
-        uint8_t temp_b1 = DHT_read_byte(pin);
-        uint8_t temp_b2 = DHT_read_byte(pin);
-        uint8_t sum = DHT_read_byte(pin);
-        uint8_t data_sum = (rh_b1 + rh_b2 + temp_b1 + temp_b2) & 0xFF;
-        if (sum == data_sum)
+    /* Average several conversions: the ESP32 ADC has a few LSB of noise per sample */
+    int32_t sum = 0;
+    for (int i = 0; i < TEMP_SENSOR_SAMPLES; i++)
+    {
+        int raw;
+        esp_err_t err = adc_oneshot_read(s_adc, TEMP_SENSOR_ADC_CHANNEL, &raw);
+        if (err != ESP_OK)
         {
-            dht11->humidity = ((rh_b1 << 8) | rh_b2) / 10.0;
-            dht11->temperature = ((temp_b1 << 8) | temp_b2) / 10.0;
-            return 1;
+            ESP_LOGE(TAG, "adc_oneshot_read failed (%s)", esp_err_to_name(err));
+            /* Never return a plausible temperature on error - the control loop would act on it */
+            return SENSOR_TEMP_INVALID;
         }
+        sum += raw;
     }
-    return 0;
+    int raw_avg = (int)((sum + TEMP_SENSOR_SAMPLES / 2) / TEMP_SENSOR_SAMPLES);
+
+    /* Calibrated conversion corrects the chip-specific reference voltage and the non-linearity */
+    int mv;
+    esp_err_t err = adc_cali_raw_to_voltage(s_cali, raw_avg, &mv);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "adc_cali_raw_to_voltage failed (%s)", esp_err_to_name(err));
+        return SENSOR_TEMP_INVALID;
+    }
+
+    /* 10 mV per degC  ->  1 mV per tenth of a degC */
+    return mv - TEMP_SENSOR_OFFSET_MV;
 }

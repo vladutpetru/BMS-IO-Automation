@@ -27,24 +27,28 @@ void app_main(void)
     /* Boil max + triggers must be loaded before the control task or HTTP server use them */
     ESP_ERROR_CHECK(app_state_init());
 
-    /* Outputs, ADC and UART first, so the relays are in a known OFF state and
-     * temperature control runs even if Wi-Fi fails to start */
+    /* Outputs (all OFF), ADC and UART */
     my_app_init();
-    if (xTaskCreate(my_application, "My Application", 4096, NULL, 10, NULL) != pdPASS)
-    {
-        ESP_LOGE(TAG, "Failed to create application task");
-    }
 
+    /* Start the radio BEFORE any relay can switch ON: the Wi-Fi PHY start-up current
+     * peak plus relay coils switching at the same moment can trip the brownout detector. */
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     ret = wifi_ap_start();
-    if (ret != ESP_OK)
+    if (ret == ESP_OK)
+    {
+        http_server();
+    }
+    else
     {
         ESP_LOGE(TAG, "Wi-Fi AP not started (%s) - web UI unavailable, control keeps running",
                  esp_err_to_name(ret));
-        return;
     }
 
-    http_server();
+    /* Temperature control (relays) starts last and runs even if Wi-Fi failed */
+    if (xTaskCreate(my_application, "My Application", 4096, NULL, 10, NULL) != pdPASS)
+    {
+        ESP_LOGE(TAG, "Failed to create application task - outputs stay OFF");
+    }
 }

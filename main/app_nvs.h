@@ -33,15 +33,8 @@ esp_err_t NVS_Write(const char* key, nvs_value_type_t type, const void* value, s
  * - APP_NVS_STRING: value = char* buffer, *len = buffer size in, actual string length out.
  * - APP_NVS_BLOB:    value = void* buffer, *len = buffer size in, actual blob size out.
  * - fixed-width numeric types: value = pointer to a variable of the matching width, len ignored (may be NULL).
- * Returns ESP_ERR_NVS_NOT_FOUND if the key has never been written.
+ * Returns ESP_ERR_NVS_NOT_FOUND if the key (or the whole namespace) has never been written.
  */
 esp_err_t NVS_Read(const char* key, nvs_value_type_t type, void* value, size_t* len);
-
-/* --- Typed convenience wrappers, kept for existing call sites --- */
-void NVS_Write_String(const char* key, const char* stringVal);
-esp_err_t NVS_Read_String(const char* key, char* value, char max_len);
-
-esp_err_t NVS_Write_U32(const char* key, uint32_t value);
-esp_err_t NVS_Read_U32(const char* key, uint32_t* value);
 
 #endif /* APP_NVS_H */

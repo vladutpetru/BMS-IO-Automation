@@ -4,7 +4,6 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
-#include "driver/adc.h"
 #include "driver/uart.h"
 #include "sensors.h"
 #include "app_state.h"
@@ -15,10 +14,6 @@ static const char *APP_TAG = "MY_APP";
 /* ------------------------------------------------------------------ */
 /* Control tuning                                                      */
 /* ------------------------------------------------------------------ */
-
-/* Boiler: OFF as soon as temp >= max; back ON only when temp < (max - 1.0 C).
- * Stops the relay chattering when the reading hovers around the maximum. */
-#define BOIL_RESTART_HYST_TENTHS   10
 
 /* Triggers: switch ON only once temp is 0.5 C inside [min, max],
  * switch OFF as soon as temp leaves [min, max]. The pin is never ON outside the window. */
@@ -43,16 +38,6 @@ static bool s_out_applied[OUT_COUNT];   /* last level written; init_action_pins(
 static bool s_sensor_fault = false;
 static int  s_last_temp_tenths = 0;
 
-/* Callbacks */
-static void IRAM_ATTR gpio_interrupt_handler(void *args)
-{
-    int pinNumber = (int)args;
-    if ((pinNumber == WaterMeterGPIO_1) || (pinNumber == WaterMeterGPIO_2))
-    {
-        /* Water meter pulse handling - not implemented yet */
-    }
-}
-
 static const char *out_name(int out)
 {
     return (out == OUT_BOILER) ? "Boiler" : app_state_trigger_name(out - OUT_TRIGGER_1);
@@ -64,6 +49,22 @@ static const char *out_name(int out)
 
 static esp_err_t init_action_pins(void)
 {
+    esp_err_t err;
+
+    /* Load the OFF level into the output register BEFORE the pins become outputs,
+     * so an active-low relay board never sees a short LOW (= ON) pulse at boot. */
+    for (int i = 0; i < OUT_COUNT; i++)
+    {
+        err = gpio_set_level(s_out_pins[i], ACTION_LEVEL(0));
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(APP_TAG, "Presetting GPIO%d OFF failed (%s)", s_out_pins[i], esp_err_to_name(err));
+            return err;
+        }
+        s_out_want[i] = false;
+        s_out_applied[i] = false;
+    }
+
     const gpio_config_t cfg = {
         .pin_bit_mask = (1ULL << ACTION_PIN_1) | (1ULL << ACTION_PIN_2) |
                         (1ULL << ACTION_PIN_3) | (1ULL << ACTION_PIN_4),
@@ -72,26 +73,12 @@ static esp_err_t init_action_pins(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    esp_err_t err = gpio_config(&cfg);
+    err = gpio_config(&cfg);
     if (err != ESP_OK)
     {
         ESP_LOGE(APP_TAG, "Action pin config failed (%s)", esp_err_to_name(err));
-        return err;
     }
-
-    for (int i = 0; i < OUT_COUNT; i++)
-    {
-        /* Everything OFF at boot (respects ACTION_ACTIVE_LEVEL) */
-        err = gpio_set_level(s_out_pins[i], ACTION_LEVEL(0));
-        if (err != ESP_OK)
-        {
-            ESP_LOGE(APP_TAG, "Setting GPIO%d OFF failed (%s)", s_out_pins[i], esp_err_to_name(err));
-            return err;
-        }
-        s_out_want[i] = false;
-        s_out_applied[i] = false;
-    }
-    return ESP_OK;
+    return err;
 }
 
 static esp_err_t init_uart(void)
@@ -130,65 +117,20 @@ static esp_err_t init_uart(void)
     return ESP_OK;
 }
 
-static esp_err_t init_water_meter_inputs(void)
-{
-    const gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << WaterMeterGPIO_1) | (1ULL << WaterMeterGPIO_2),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_POSEDGE,
-    };
-    esp_err_t err = gpio_config(&cfg);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(APP_TAG, "Water meter input config failed (%s)", esp_err_to_name(err));
-        return err;
-    }
-
-    err = gpio_install_isr_service(0);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)   /* INVALID_STATE = already installed */
-    {
-        ESP_LOGE(APP_TAG, "gpio_install_isr_service failed (%s)", esp_err_to_name(err));
-        return err;
-    }
-
-    err = gpio_isr_handler_add(WaterMeterGPIO_1, gpio_interrupt_handler, (void *)WaterMeterGPIO_1);
-    if (err == ESP_OK)
-    {
-        err = gpio_isr_handler_add(WaterMeterGPIO_2, gpio_interrupt_handler, (void *)WaterMeterGPIO_2);
-    }
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(APP_TAG, "gpio_isr_handler_add failed (%s)", esp_err_to_name(err));
-    }
-    return err;
-}
-
 void my_app_init(void)
 {
-    /* Analog temperature sensor on ADC1 (GPIO36) */
-    esp_err_t err = adc1_config_width(ADC_WIDTH_BIT_12);
-    if (err == ESP_OK)
-    {
-        err = adc1_config_channel_atten(TEMP_SENSOR_ADC_CHANNEL, ADC_ATTEN_DB_11);
-    }
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(APP_TAG, "ADC config failed (%s)", esp_err_to_name(err));
-    }
-
-    if (init_uart() != ESP_OK)
-    {
-        ESP_LOGE(APP_TAG, "UART2 not available");
-    }
+    /* Outputs first, so the relays are OFF as early as possible */
     if (init_action_pins() != ESP_OK)
     {
         ESP_LOGE(APP_TAG, "Action outputs not available");
     }
-    if (init_water_meter_inputs() != ESP_OK)
+    if (sensors_init() != ESP_OK)
     {
-        ESP_LOGE(APP_TAG, "Water meter inputs not available");
+        ESP_LOGE(APP_TAG, "Temperature sensor not available - all outputs stay OFF");
+    }
+    if (init_uart() != ESP_OK)
+    {
+        ESP_LOGE(APP_TAG, "UART2 not available");
     }
 }
 
@@ -196,14 +138,19 @@ void my_app_init(void)
 /* Control logic                                                       */
 /* ------------------------------------------------------------------ */
 
-/* Boiler runs below the maximum, stops at/above it */
-static bool boiler_should_run(int temp, int max, bool running)
+/* Thermostat: ON below min, OFF at/above max, unchanged in between.
+ * The min..max band is the hysteresis that stops the relay chattering. */
+static bool boiler_should_run(int temp, int min, int max, bool running)
 {
-    if (running)
+    if (temp >= max)
     {
-        return temp < max;
+        return false;
     }
-    return temp < (max - BOIL_RESTART_HYST_TENTHS);
+    if (temp < min)
+    {
+        return true;
+    }
+    return running;
 }
 
 /* Trigger is set while temp is inside [min, max], reset otherwise */
@@ -228,7 +175,7 @@ static void control_update(void)
     {
         if (!s_sensor_fault)
         {
-            if (have_temp && temp != SENSOR_TEMP_INVALID)
+            if (have_temp)
             {
                 ESP_LOGE(APP_TAG, "Implausible temperature %.1f C - all outputs OFF", temp / 10.0);
             }
@@ -251,9 +198,19 @@ static void control_update(void)
     }
     s_last_temp_tenths = temp;
 
-    /* Boiler */
-    s_out_want[OUT_BOILER] = boiler_should_run(temp, app_state_get_boil_max_tenths(),
-                                               s_out_want[OUT_BOILER]);
+    /* Boiler: min/max are whole degC, temperature is in tenths */
+    app_trigger_t boil;
+    esp_err_t berr = app_state_get_boil(&boil);
+    if (berr != ESP_OK)
+    {
+        ESP_LOGE(APP_TAG, "Reading boiler min/max failed (%s) - boiler OFF", esp_err_to_name(berr));
+        s_out_want[OUT_BOILER] = false;
+    }
+    else
+    {
+        s_out_want[OUT_BOILER] = boiler_should_run(temp, boil.min * 10, boil.max * 10,
+                                                   s_out_want[OUT_BOILER]);
+    }
 
     /* Triggers: min/max are whole degC, temperature is in tenths */
     for (int i = 0; i < APP_TRIGGER_COUNT; i++)
@@ -277,7 +234,15 @@ static void control_update(void)
 
 static void input(void)
 {
-    app_state_set_temp_tenths(read_temperature_tenths_c(TEMP_SENSOR_ADC_CHANNEL));
+    int t = read_temperature_tenths_c();
+    if (t == SENSOR_TEMP_INVALID)
+    {
+        app_state_invalidate_temp();    /* web page shows "no reading", control goes fail-safe */
+    }
+    else
+    {
+        app_state_set_temp_tenths(t);
+    }
 }
 
 static void loop(void)

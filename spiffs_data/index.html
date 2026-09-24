@@ -27,25 +27,24 @@ h3{font-size:1rem;margin:0}
 .reading output{font-size:3.5rem;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
 .reading span{font-size:1.5rem;color:var(--muted)}
 .gauge{position:relative;height:12px;border-radius:6px;background:var(--line);margin:16px 0 6px}
+.gauge .band{position:absolute;top:0;bottom:0;background:var(--cold);opacity:.18;border-radius:6px}
 .gauge .fill{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:6px;background:var(--cold);
              transition:width .6s ease,background-color .3s}
 .gauge .fill.hot{background:var(--heat)}
-.gauge .limit{position:absolute;top:-6px;bottom:-6px;width:3px;margin-left:-1px;background:var(--ink);border-radius:2px}
+.gauge .mark{position:absolute;top:-6px;bottom:-6px;width:3px;margin-left:-1px;background:var(--ink);border-radius:2px}
 .scale{display:flex;justify-content:space-between;font-size:.8125rem;color:var(--muted)}
-.note{margin:8px 0 12px;color:var(--muted)}
+.note{margin:8px 0 4px;color:var(--muted)}
 .note.hot{color:var(--heat);font-weight:600}
+.note.cold{color:var(--cold);font-weight:600}
 
-form.row{display:grid;grid-template-columns:1fr auto auto;gap:8px 12px;align-items:center;
-         padding-top:12px;border-top:1px solid var(--line)}
-.row label{font-weight:600}
-
-form.trigger{display:grid;grid-template-columns:auto auto 1fr;gap:8px 16px;align-items:end;
-             padding:14px 0;border-top:1px solid var(--line)}
-#triggers form.trigger:first-child{border-top:0;padding-top:4px}
-.trigger h3{grid-column:1/-1}
-.trigger .num{display:grid;gap:2px}
-.trigger .num label{font-size:.875rem;color:var(--muted)}
-.trigger button{justify-self:start}
+form.range{display:grid;grid-template-columns:auto auto 1fr;gap:8px 16px;align-items:end;
+           padding:14px 0;border-top:1px solid var(--line)}
+.stack > form.range:first-child{border-top:0;padding-top:4px}
+#boiler{margin-top:12px;border-top:1px solid var(--line);padding-top:4px}
+.range h3{grid-column:1/-1}
+.range .num{display:grid;gap:2px}
+.range .num label{font-size:.875rem;color:var(--muted)}
+.range button{justify-self:start}
 
 .status{grid-column:1/-1;min-height:1.25em;font-size:.875rem;margin:0}
 .status.ok{color:var(--ok)}
@@ -63,36 +62,36 @@ button:disabled{opacity:.5;cursor:default}
 </head>
 <body>
 <main>
-  <h1>BMS IO Automation</h1>
+  <h1>Boiler controller</h1>
 
   <section aria-labelledby="boil-h">
-    <h2 id="boil-h">Boiling</h2>
+    <h2 id="boil-h">Boiler</h2>
     <p class="reading"><output id="temp" aria-live="polite">--</output><span>°C</span></p>
-    <div class="gauge" aria-hidden="true"><div class="fill" id="fill"></div><div class="limit" id="limit" hidden></div></div>
-    <div class="scale" aria-hidden="true"><span>0 °C</span><span>125 °C</span></div>
+    <div class="gauge" aria-hidden="true">
+      <div class="band" id="band" hidden></div>
+      <div class="fill" id="fill"></div>
+      <div class="mark" id="markMin" hidden></div>
+      <div class="mark" id="markMax" hidden></div>
+    </div>
+    <div class="scale" aria-hidden="true"><span>0 °C</span><span>100 °C</span></div>
     <p class="note" id="tempNote">Waiting for the first reading…</p>
-    <form class="row" id="boilForm" novalidate>
-      <label for="boilMax">Maximum temperature (°C)</label>
-      <input type="number" id="boilMax" min="0" max="125" step="0.1" required>
-      <button type="submit">Save</button>
-      <p class="status" role="status"></p>
-    </form>
+    <p class="hint">Boiler switches ON below min and OFF at max. Whole numbers from 0 to 80; max must be greater than min.</p>
+    <div class="stack" id="boiler"><p class="note">Loading…</p></div>
   </section>
 
   <section aria-labelledby="trig-h">
     <h2 id="trig-h">Triggers</h2>
-    <p class="hint">Whole numbers from 20 to 100. Max must be greater than min.</p>
-    <div id="triggers"><p class="note">Loading…</p></div>
+    <p class="hint">On while the temperature is between min and max. Whole numbers from 0 to 100; max must be greater than min.</p>
+    <div class="stack" id="triggers"><p class="note">Loading…</p></div>
   </section>
 </main>
 
 <script>
 (function () {
   'use strict';
-  var GAUGE_MAX_C = 125;
-  var TRIG_LO = 20, TRIG_HI = 100;
+  var GAUGE_MAX_C = 100;
   var $ = function (id) { return document.getElementById(id); };
-  var boilMaxC = null;
+  var boiler = null;      /* {min, max} as saved on the device */
   var lastTemp = null;
 
   async function api(path, options) {
@@ -127,16 +126,15 @@ button:disabled{opacity:.5;cursor:default}
     try { await fn(); } finally { b.disabled = false; }
   }
 
-  function readValue(input, min, max, integer) {
+  function readValue(input, min, max) {
     var v = input.valueAsNumber;
-    if (!Number.isFinite(v) || v < min || v > max) return null;
-    if (integer && !Number.isInteger(v)) return null;
+    if (!Number.isFinite(v) || v < min || v > max || !Number.isInteger(v)) return null;
     return v;
   }
 
   function pct(v) { return Math.max(0, Math.min(100, v / GAUGE_MAX_C * 100)); }
 
-  /* ---------- Boiling ---------- */
+  /* ---------- Boiler reading ---------- */
   function renderTemp() {
     var fill = $('fill'), note = $('tempNote');
     if (lastTemp === null) {
@@ -148,25 +146,32 @@ button:disabled{opacity:.5;cursor:default}
     }
     $('temp').textContent = lastTemp.toFixed(1);
     fill.style.width = pct(lastTemp) + '%';
-    var hot = boilMaxC !== null && lastTemp >= boilMaxC;
+    var hot = boiler !== null && lastTemp >= boiler.max;
     fill.classList.toggle('hot', hot);
-    if (boilMaxC === null) {
+    if (boiler === null) {
       note.textContent = '';
       note.className = 'note';
     } else if (hot) {
-      note.textContent = 'Maximum reached (' + boilMaxC.toFixed(1) + ' °C).';
+      note.textContent = 'At or above the maximum (' + boiler.max + ' °C): boiler OFF.';
       note.className = 'note hot';
+    } else if (lastTemp < boiler.min) {
+      note.textContent = 'Below the minimum (' + boiler.min + ' °C): boiler ON.';
+      note.className = 'note cold';
     } else {
-      note.textContent = (boilMaxC - lastTemp).toFixed(1) + ' °C below the maximum.';
+      note.textContent = 'Between min and max: boiler keeps its current state.';
       note.className = 'note';
     }
   }
 
-  function renderLimit() {
-    var l = $('limit');
-    if (boilMaxC === null) { l.hidden = true; return; }
-    l.hidden = false;
-    l.style.left = pct(boilMaxC) + '%';
+  function renderBand() {
+    var band = $('band'), lo = $('markMin'), hi = $('markMax');
+    var show = boiler !== null;
+    band.hidden = lo.hidden = hi.hidden = !show;
+    if (!show) return;
+    lo.style.left = pct(boiler.min) + '%';
+    hi.style.left = pct(boiler.max) + '%';
+    band.style.left = pct(boiler.min) + '%';
+    band.style.width = (pct(boiler.max) - pct(boiler.min)) + '%';
     if (lastTemp !== null) renderTemp();
   }
 
@@ -181,105 +186,109 @@ button:disabled{opacity:.5;cursor:default}
     setTimeout(pollTemp, 2000);
   }
 
-  $('boilForm').addEventListener('submit', function (e) {
-    e.preventDefault();
-    var form = e.currentTarget;
-    var v = readValue($('boilMax'), 0, GAUGE_MAX_C, false);
-    if (v === null) { setStatus(form, 'Enter a value from 0 to 125 °C.', false); return; }
-    withBusy(form, async function () {
-      try {
-        var d = await postJson('/api/boil', { boil_max_c: Math.round(v * 10) / 10 });
-        boilMaxC = d.boil_max_c;
-        $('boilMax').value = boilMaxC;
-        renderLimit();
-        setStatus(form, 'Saved: ' + boilMaxC.toFixed(1) + ' °C', true);
-      } catch (err) {
-        setStatus(form, 'Not saved: ' + err.message, false);
-      }
-    });
-  });
+  /* ---------- Min/max forms (boiler + triggers) ---------- */
+  /* opts: { title, idPrefix, lo, hi, min, max, save(min, max) -> Promise<{min,max}>, onSaved(d) } */
+  function makeRangeForm(opts) {
+    var form = document.createElement('form');
+    form.className = 'range';
+    form.noValidate = true;
+    var attrs = ' min="' + opts.lo + '" max="' + opts.hi + '" step="1" required';
+    form.innerHTML =
+      (opts.title ? '<h3></h3>' : '') +
+      '<div class="num"><label>Min (°C)</label><input type="number"' + attrs + '></div>' +
+      '<div class="num"><label>Max (°C)</label><input type="number"' + attrs + '></div>' +
+      '<button type="submit">Save</button>' +
+      '<p class="status" role="status"></p>';
+    if (opts.title) form.querySelector('h3').textContent = opts.title;
+    var labels = form.querySelectorAll('label');
+    var inputs = form.querySelectorAll('input');
+    var minEl = inputs[0], maxEl = inputs[1];
+    minEl.id = opts.idPrefix + 'Min';
+    maxEl.id = opts.idPrefix + 'Max';
+    labels[0].htmlFor = minEl.id;
+    labels[1].htmlFor = maxEl.id;
+    minEl.value = opts.min;
+    maxEl.value = opts.max;
 
-  /* ---------- Triggers ---------- */
-  /* Returns an error message, or null when min/max are valid */
-  function checkTrigger(minEl, maxEl) {
-    var lo = readValue(minEl, TRIG_LO, TRIG_HI, true);
-    var hi = readValue(maxEl, TRIG_LO, TRIG_HI, true);
-    minEl.setAttribute('aria-invalid', lo === null);
-    maxEl.setAttribute('aria-invalid', hi === null);
-    if (lo === null) return 'Min must be a whole number from 20 to 100.';
-    if (hi === null) return 'Max must be a whole number from 20 to 100.';
-    if (hi <= lo) {
-      maxEl.setAttribute('aria-invalid', true);
-      return 'Max must be greater than min.';
+    var rangeText = ' must be a whole number from ' + opts.lo + ' to ' + opts.hi + '.';
+    function check() {
+      var lo = readValue(minEl, opts.lo, opts.hi);
+      var hi = readValue(maxEl, opts.lo, opts.hi);
+      minEl.setAttribute('aria-invalid', lo === null);
+      maxEl.setAttribute('aria-invalid', hi === null);
+      if (lo === null) return 'Min' + rangeText;
+      if (hi === null) return 'Max' + rangeText;
+      if (hi <= lo) {
+        maxEl.setAttribute('aria-invalid', true);
+        return 'Max must be greater than min.';
+      }
+      return null;
     }
-    return null;
+    function onEdit() { setStatus(form, check() || '', false); }
+    minEl.addEventListener('input', onEdit);
+    maxEl.addEventListener('input', onEdit);
+
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      var msg = check();
+      if (msg) { setStatus(form, msg, false); return; }
+      var mn = minEl.valueAsNumber, mx = maxEl.valueAsNumber;
+      withBusy(form, async function () {
+        try {
+          var d = await opts.save(mn, mx);
+          minEl.value = d.min;
+          maxEl.value = d.max;
+          setStatus(form, 'Saved: ' + d.min + ' – ' + d.max + ' °C', true);
+          if (opts.onSaved) opts.onSaved(d);
+        } catch (err) {
+          setStatus(form, 'Not saved: ' + err.message, false);
+        }
+      });
+    });
+    return form;
+  }
+
+  function buildBoiler(b) {
+    var box = $('boiler');
+    box.textContent = '';
+    box.appendChild(makeRangeForm({
+      title: null, idPrefix: 'boil', lo: 0, hi: 80, min: b.min, max: b.max,
+      save: function (mn, mx) { return postJson('/api/boil', { min: mn, max: mx }); },
+      onSaved: function (d) { boiler = { min: d.min, max: d.max }; renderBand(); }
+    }));
   }
 
   function buildTriggers(triggers) {
     var box = $('triggers');
     box.textContent = '';
     triggers.forEach(function (t) {
-      var form = document.createElement('form');
-      form.className = 'trigger';
-      form.noValidate = true;
-      form.innerHTML =
-        '<h3></h3>' +
-        '<div class="num"><label>Min</label><input type="number" min="20" max="100" step="1" required></div>' +
-        '<div class="num"><label>Max</label><input type="number" min="20" max="100" step="1" required></div>' +
-        '<button type="submit">Save</button>' +
-        '<p class="status" role="status"></p>';
-      form.querySelector('h3').textContent = t.name;
-      var labels = form.querySelectorAll('label');
-      var inputs = form.querySelectorAll('input');
-      var minEl = inputs[0], maxEl = inputs[1];
-      minEl.id = 'trig' + t.id + 'min';
-      maxEl.id = 'trig' + t.id + 'max';
-      labels[0].htmlFor = minEl.id;
-      labels[1].htmlFor = maxEl.id;
-      minEl.value = t.min;
-      maxEl.value = t.max;
+      box.appendChild(makeRangeForm({
+        title: t.name, idPrefix: 'trig' + t.id, lo: 0, hi: 100, min: t.min, max: t.max,
+        save: function (mn, mx) { return postJson('/api/trigger', { id: t.id, min: mn, max: mx }); }
+      }));
+    });
+  }
 
-      function onEdit() {
-        var msg = checkTrigger(minEl, maxEl);
-        setStatus(form, msg || '', false);
-      }
-      minEl.addEventListener('input', onEdit);
-      maxEl.addEventListener('input', onEdit);
-
-      form.addEventListener('submit', function (e) {
-        e.preventDefault();
-        var msg = checkTrigger(minEl, maxEl);
-        if (msg) { setStatus(form, msg, false); return; }
-        var body = { id: t.id, min: minEl.valueAsNumber, max: maxEl.valueAsNumber };
-        withBusy(form, async function () {
-          try {
-            var d = await postJson('/api/trigger', body);
-            minEl.value = d.min;
-            maxEl.value = d.max;
-            setStatus(form, 'Saved: ' + d.min + ' – ' + d.max, true);
-          } catch (err) {
-            setStatus(form, 'Not saved: ' + err.message, false);
-          }
-        });
-      });
-      box.appendChild(form);
+  function showLoadError(msg) {
+    ['boiler', 'triggers'].forEach(function (id) {
+      var box = $(id);
+      box.textContent = '';
+      var p = document.createElement('p');
+      p.className = 'status err';
+      p.textContent = msg;
+      box.appendChild(p);
     });
   }
 
   async function loadSettings() {
     try {
       var d = await api('/api/settings');
-      boilMaxC = d.boil_max_c;
-      $('boilMax').value = boilMaxC;
-      renderLimit();
+      boiler = { min: d.boiler.min, max: d.boiler.max };
+      renderBand();
+      buildBoiler(boiler);
       buildTriggers(d.triggers);
     } catch (e) {
-      var box = $('triggers');
-      box.textContent = '';
-      var p = document.createElement('p');
-      p.className = 'status err';
-      p.textContent = 'Could not load settings: ' + e.message + '. Retrying in 5 s.';
-      box.appendChild(p);
+      showLoadError('Could not load settings: ' + e.message + '. Retrying in 5 s.');
       setTimeout(loadSettings, 5000);
     }
   }
