@@ -6,6 +6,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "app_state.h"
+#include "bms.h"
 #include "wifi_ap.h"
 #include "create_http_server.h"
 #include "my_application.h"
@@ -24,11 +25,18 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* Boil max + triggers must be loaded before the control task or HTTP server use them */
+    /* Boiler + triggers must be loaded before the control task or HTTP server use them */
     ESP_ERROR_CHECK(app_state_init());
 
-    /* Outputs (all OFF), ADC and UART */
+    /* Outputs (all OFF) and temperature sensor */
     my_app_init();
+
+    /* Battery SoC over Modbus RTU on UART2 */
+    ret = bms_start();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "BMS polling not started (%s) - triggers stay OFF", esp_err_to_name(ret));
+    }
 
     /* Start the radio BEFORE any relay can switch ON: the Wi-Fi PHY start-up current
      * peak plus relay coils switching at the same moment can trip the brownout detector. */
@@ -46,7 +54,7 @@ void app_main(void)
                  esp_err_to_name(ret));
     }
 
-    /* Temperature control (relays) starts last and runs even if Wi-Fi failed */
+    /* Output control starts last and runs even if Wi-Fi failed */
     if (xTaskCreate(my_application, "My Application", 4096, NULL, 10, NULL) != pdPASS)
     {
         ESP_LOGE(TAG, "Failed to create application task - outputs stay OFF");

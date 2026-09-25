@@ -2,16 +2,9 @@
 #define MY_APPLICATION_H
 
 #include "driver/gpio.h"
-#include "driver/uart.h"
 
-/* Analog temperature sensor: see sensors.h (ADC1 channel 0 = GPIO36) */
-
-/* UART2 - external serial device */
-#define UART_PORT_NUM   UART_NUM_2
-#define UART_TX_PIN     GPIO_NUM_17
-#define UART_RX_PIN     GPIO_NUM_16
-#define UART_BAUD_RATE  115200
-#define UART_BUF_SIZE   1024
+/* Analog temperature sensor: see sensors.h (ADC1 channel 0 = GPIO36)
+ * JK BMS on UART2 (GPIO17 TX / GPIO16 RX): see bms.h */
 
 /* Relay / valve action outputs (simple on-off) */
 #define ACTION_PIN_1 GPIO_NUM_4
@@ -21,10 +14,13 @@
 #define ACTION_PIN_COUNT 4
 
 /* Roles of the action outputs */
-#define BOILER_PIN     ACTION_PIN_1   /* ON below boiler min, OFF at/above boiler max */
-#define TRIGGER_1_PIN  ACTION_PIN_2   /* ON while temperature is inside trigger 1 min..max */
-#define TRIGGER_2_PIN  ACTION_PIN_3   /* ON while temperature is inside trigger 2 min..max */
-#define TRIGGER_3_PIN  ACTION_PIN_4   /* ON while temperature is inside trigger 3 min..max */
+#define BOILER_PIN     ACTION_PIN_1   /* ON below boiler min temp, OFF at/above boiler max temp */
+#define TRIGGER_1_PIN  ACTION_PIN_2   /* ON while battery SoC is inside trigger 1 min..max */
+#define TRIGGER_2_PIN  ACTION_PIN_3   /* ON while battery SoC is inside trigger 2 min..max */
+#define TRIGGER_3_PIN  ACTION_PIN_4   /* ON while battery SoC is inside trigger 3 min..max */
+
+/* Minimum time between two state changes of the same output */
+#define OUTPUT_MIN_DWELL_S  60
 
 /* 1 = output ON when pin is HIGH (active-high relay board).
  * 0 = output ON when pin is LOW  (active-low relay board). */

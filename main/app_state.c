@@ -11,41 +11,50 @@
 static const char *TAG = "APP_STATE";
 
 /* NVS keys must be <= 15 characters */
-#define NVS_KEY_BOILER "boiler"   /* packed min/max; the old "boil_max" key is no longer used */
+#define NVS_KEY_BOILER "boiler"
 
 /* Display names of the triggers - rename them here */
 static const char *const s_trigger_names[APP_TRIGGER_COUNT] = { "Trigger 1", "Trigger 2", "Trigger 3" };
-/* Each trigger is stored as ONE u32 key (min << 8 | max) so min and max are always written together */
+/* Each min/max pair is stored as ONE u32 key (min << 8 | max) so both are always written together */
 static const char *const s_trigger_keys[APP_TRIGGER_COUNT]  = { "trigger_0", "trigger_1", "trigger_2" };
 
 static SemaphoreHandle_t s_lock = NULL;
 static app_trigger_t s_boiler = { APP_BOIL_DEFAULT_MIN, APP_BOIL_DEFAULT_MAX };
 static app_trigger_t s_triggers[APP_TRIGGER_COUNT];
 
-/* Value and validity live in ONE aligned 32-bit word, which the ESP32 reads and writes
- * atomically: a reader can never see a new "valid" flag together with a stale value. */
+/* Live values shared between tasks: each lives in ONE aligned 32-bit word, which the ESP32
+ * reads and writes atomically, so no reader can ever see a half-updated value. */
 #define TEMP_NONE INT_MIN
-static volatile int s_temp_tenths = TEMP_NONE;
+#define SOC_NONE  (-1)
+static volatile int      s_temp_tenths = TEMP_NONE;
+static volatile int      s_soc = SOC_NONE;
+static volatile uint32_t s_outputs = 0;    /* byte n = output n: bit 7 = on, bits 0..6 = wait_s */
 
-static uint32_t pack_trigger(int min, int max)
+_Static_assert(APP_OUT_COUNT <= 4, "output states are packed into one 32-bit word");
+
+/* ------------------------------------------------------------------ */
+/* Min/max pairs                                                       */
+/* ------------------------------------------------------------------ */
+
+static uint32_t pack_pair(int min, int max)
 {
     return ((uint32_t)(min & 0xFF) << 8) | (uint32_t)(max & 0xFF);
 }
 
-static void unpack_trigger(uint32_t packed, app_trigger_t *t)
+static void unpack_pair(uint32_t packed, app_trigger_t *t)
 {
     t->min = (int)((packed >> 8) & 0xFF);
     t->max = (int)(packed & 0xFF);
 }
 
-static bool app_trigger_is_valid(int min, int max)
+static bool trigger_is_valid(int min, int max)
 {
     return min >= APP_TRIGGER_LIMIT_MIN && min <= APP_TRIGGER_LIMIT_MAX &&
            max >= APP_TRIGGER_LIMIT_MIN && max <= APP_TRIGGER_LIMIT_MAX &&
            max > min;
 }
 
-static bool app_boil_is_valid(int min, int max)
+static bool boil_is_valid(int min, int max)
 {
     return min >= APP_BOIL_LIMIT_MIN && min <= APP_BOIL_LIMIT_MAX &&
            max >= APP_BOIL_LIMIT_MIN && max <= APP_BOIL_LIMIT_MAX &&
@@ -61,7 +70,7 @@ static app_trigger_t load_pair(const char *key, app_trigger_t def, bool (*is_val
     if (err == ESP_ERR_NVS_NOT_FOUND)
     {
         ESP_LOGI(TAG, "'%s' not stored yet, writing default %d-%d", key, def.min, def.max);
-        packed = pack_trigger(def.min, def.max);
+        packed = pack_pair(def.min, def.max);
         err = NVS_Write(key, APP_NVS_U32, &packed, sizeof(packed));
         if (err != ESP_OK)
         {
@@ -76,10 +85,11 @@ static app_trigger_t load_pair(const char *key, app_trigger_t def, bool (*is_val
     }
 
     app_trigger_t t;
-    unpack_trigger(packed, &t);
+    unpack_pair(packed, &t);
     if (!is_valid(t.min, t.max))
     {
-        ESP_LOGW(TAG, "'%s' holds invalid %d-%d, using default", key, t.min, t.max);
+        ESP_LOGW(TAG, "'%s' holds %d-%d, outside the allowed range - using default %d-%d",
+                 key, t.min, t.max, def.min, def.max);
         return def;
     }
     return t;
@@ -88,7 +98,7 @@ static app_trigger_t load_pair(const char *key, app_trigger_t def, bool (*is_val
 /* Persist first; RAM is only updated if the flash write succeeded, so both always agree */
 static esp_err_t save_pair(const char *key, app_trigger_t *dst, int min, int max)
 {
-    uint32_t packed = pack_trigger(min, max);
+    uint32_t packed = pack_pair(min, max);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     esp_err_t err = NVS_Write(key, APP_NVS_U32, &packed, sizeof(packed));
     if (err == ESP_OK)
@@ -112,6 +122,10 @@ static void read_pair(const app_trigger_t *src, app_trigger_t *out)
     xSemaphoreGive(s_lock);
 }
 
+/* ------------------------------------------------------------------ */
+/* Init                                                                */
+/* ------------------------------------------------------------------ */
+
 esp_err_t app_state_init(void)
 {
     if (s_lock != NULL)
@@ -127,21 +141,25 @@ esp_err_t app_state_init(void)
     }
 
     const app_trigger_t boil_def = { APP_BOIL_DEFAULT_MIN, APP_BOIL_DEFAULT_MAX };
-    s_boiler = load_pair(NVS_KEY_BOILER, boil_def, app_boil_is_valid);
+    s_boiler = load_pair(NVS_KEY_BOILER, boil_def, boil_is_valid);
 
     const app_trigger_t trig_def = { APP_TRIGGER_DEFAULT_MIN, APP_TRIGGER_DEFAULT_MAX };
     for (int i = 0; i < APP_TRIGGER_COUNT; i++)
     {
-        s_triggers[i] = load_pair(s_trigger_keys[i], trig_def, app_trigger_is_valid);
+        s_triggers[i] = load_pair(s_trigger_keys[i], trig_def, trigger_is_valid);
     }
 
-    ESP_LOGI(TAG, "Loaded: boiler %d-%d C, triggers %d-%d / %d-%d / %d-%d",
+    ESP_LOGI(TAG, "Loaded: boiler %d-%d C, triggers %d-%d / %d-%d / %d-%d %% SoC",
              s_boiler.min, s_boiler.max,
              s_triggers[0].min, s_triggers[0].max,
              s_triggers[1].min, s_triggers[1].max,
              s_triggers[2].min, s_triggers[2].max);
     return ESP_OK;
 }
+
+/* ------------------------------------------------------------------ */
+/* Live values                                                         */
+/* ------------------------------------------------------------------ */
 
 void app_state_set_temp_tenths(int tenths)
 {
@@ -155,7 +173,7 @@ void app_state_invalidate_temp(void)
 
 bool app_state_get_temp_tenths(int *tenths)
 {
-    int value = s_temp_tenths;      /* single read of the shared word */
+    int value = s_temp_tenths;
     if (tenths == NULL || value == TEMP_NONE)
     {
         return false;
@@ -163,6 +181,54 @@ bool app_state_get_temp_tenths(int *tenths)
     *tenths = value;
     return true;
 }
+
+void app_state_set_soc(int soc)
+{
+    s_soc = (soc >= 0 && soc <= 100) ? soc : SOC_NONE;
+}
+
+void app_state_invalidate_soc(void)
+{
+    s_soc = SOC_NONE;
+}
+
+bool app_state_get_soc(int *soc)
+{
+    int value = s_soc;
+    if (soc == NULL || value == SOC_NONE)
+    {
+        return false;
+    }
+    *soc = value;
+    return true;
+}
+
+void app_state_set_outputs(const app_output_status_t status[APP_OUT_COUNT])
+{
+    uint32_t packed = 0;
+    for (int i = 0; i < APP_OUT_COUNT; i++)
+    {
+        uint32_t wait = status[i].wait_s > 127 ? 127 : status[i].wait_s;
+        uint32_t byte = (status[i].on ? 0x80u : 0u) | wait;
+        packed |= byte << (8 * i);
+    }
+    s_outputs = packed;
+}
+
+void app_state_get_outputs(app_output_status_t status[APP_OUT_COUNT])
+{
+    uint32_t packed = s_outputs;
+    for (int i = 0; i < APP_OUT_COUNT; i++)
+    {
+        uint32_t byte = (packed >> (8 * i)) & 0xFFu;
+        status[i].on = (byte & 0x80u) != 0;
+        status[i].wait_s = (uint8_t)(byte & 0x7Fu);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Boiler                                                              */
+/* ------------------------------------------------------------------ */
 
 esp_err_t app_state_get_boil(app_trigger_t *out)
 {
@@ -180,7 +246,7 @@ esp_err_t app_state_set_boil(int min, int max)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!app_boil_is_valid(min, max))
+    if (!boil_is_valid(min, max))
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -195,6 +261,10 @@ esp_err_t app_state_set_boil(int min, int max)
     }
     return err;
 }
+
+/* ------------------------------------------------------------------ */
+/* Triggers                                                            */
+/* ------------------------------------------------------------------ */
 
 esp_err_t app_state_get_trigger(int id, app_trigger_t *out)
 {
@@ -216,16 +286,14 @@ esp_err_t app_state_set_trigger(int id, int min, int max)
     {
         return ESP_ERR_NOT_FOUND;
     }
-    if (!app_trigger_is_valid(min, max))
+    if (!trigger_is_valid(min, max))
     {
         return ESP_ERR_INVALID_ARG;
     }
-
     esp_err_t err = save_pair(s_trigger_keys[id], &s_triggers[id], min, max);
-
     if (err == ESP_OK)
     {
-        ESP_LOGI(TAG, "%s set to %d-%d", s_trigger_names[id], min, max);
+        ESP_LOGI(TAG, "%s set to %d-%d %% SoC", s_trigger_names[id], min, max);
     }
     else
     {

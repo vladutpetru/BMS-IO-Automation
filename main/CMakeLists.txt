@@ -5,6 +5,7 @@ idf_component_register(SRCS "main_app.c"
                             "app_state.c"
                             "my_application.c"
                             "sensors.c"
+                            "bms.c"
                     INCLUDE_DIRS "."
                     REQUIRES esp_wifi
                              esp_netif
@@ -12,7 +13,6 @@ idf_component_register(SRCS "main_app.c"
                              esp_event
                              esp_http_server
                              spiffs
-                             esp_timer
                              driver
                              esp_adc
                              json)

@@ -22,4 +22,53 @@ menu "BMS IO Automation"
         range 1 10
         default 1
 
+    menu "JK BMS (Modbus RTU on UART2)"
+
+        config APP_BMS_BAUD
+            int "Baud rate"
+            default 115200
+            help
+                Must match the baud rate of the BMS RS485 port (8N1).
+
+        config APP_BMS_SLAVE_ID
+            int "BMS Modbus address"
+            range 0 247
+            default 0
+            help
+                Address set with the BMS DIP switches. 0 matches the reference STM32 project.
+
+        config APP_BMS_SOC_REGISTER
+            hex "SoC holding register"
+            range 0x0 0xFFFF
+            default 0x12A6
+            help
+                JK-PB "BMS RS485 Modbus V1.x": SoC is the low byte of holding register 0x12A6.
+
+        config APP_BMS_SOC_MASK
+            hex "SoC bit mask within the register"
+            range 0x1 0xFFFF
+            default 0x00FF
+            help
+                Bits of the register that hold the SoC. 0x00FF = low byte, 0xFF00 = high byte.
+
+        config APP_BMS_RS485_DE_GPIO
+            int "RS485 driver-enable (DE/RE) GPIO, -1 = auto-direction module"
+            range -1 33
+            default -1
+            help
+                For a MAX3485-style transceiver, the GPIO wired to DE and /RE.
+                Leave -1 for transceiver modules that switch direction automatically.
+
+        config APP_BMS_POLL_MS
+            int "Poll period (ms)"
+            range 200 10000
+            default 1000
+
+        config APP_BMS_RESPONSE_TIMEOUT_MS
+            int "Response timeout (ms)"
+            range 20 2000
+            default 300
+
+    endmenu
+
 endmenu

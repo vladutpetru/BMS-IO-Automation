@@ -150,6 +150,13 @@ static bool parse_min_max(const cJSON *root, int lo, int hi, int *min, int *max,
     return true;
 }
 
+/* Adds {"on":bool,"wait_s":n} for one output to obj */
+static bool add_output_status(cJSON *obj, const app_output_status_t *st)
+{
+    return cJSON_AddBoolToObject(obj, "on", st->on) != NULL &&
+           cJSON_AddNumberToObject(obj, "wait_s", st->wait_s) != NULL;
+}
+
 /* ------------------------------------------------------------------ */
 /* GET / and /index.html - streamed from SPIFFS in 1 KB chunks          */
 /* ------------------------------------------------------------------ */
@@ -213,6 +220,63 @@ static esp_err_t temperature_get_handler(httpd_req_t *req)
     char json[32];
     snprintf(json, sizeof(json), "{\"temp_c\":%.1f}", tenths / 10.0);
     return send_json(req, json);
+}
+
+/* ------------------------------------------------------------------ */
+/* GET /api/status                                                     */
+/* {"temp_c":23.5,"soc":57,"boiler":{"on":true,"wait_s":0},            */
+/*  "triggers":[{"id":0,"on":false,"wait_s":42},..]}                   */
+/* temp_c / soc are null while no valid value is available.            */
+/* ------------------------------------------------------------------ */
+
+static esp_err_t status_get_handler(httpd_req_t *req)
+{
+    int tenths, soc;
+    bool have_temp = app_state_get_temp_tenths(&tenths);
+    bool have_soc = app_state_get_soc(&soc);
+    app_output_status_t out[APP_OUT_COUNT];
+    app_state_get_outputs(out);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *boiler = NULL;
+    cJSON *triggers = NULL;
+
+    if (root == NULL ||
+        (have_temp ? cJSON_AddNumberToObject(root, "temp_c", tenths / 10.0)
+                   : cJSON_AddNullToObject(root, "temp_c")) == NULL ||
+        (have_soc ? cJSON_AddNumberToObject(root, "soc", soc)
+                  : cJSON_AddNullToObject(root, "soc")) == NULL ||
+        (boiler = cJSON_AddObjectToObject(root, "boiler")) == NULL ||
+        !add_output_status(boiler, &out[APP_OUT_BOILER]) ||
+        (triggers = cJSON_AddArrayToObject(root, "triggers")) == NULL)
+    {
+        goto oom;
+    }
+
+    for (int i = 0; i < APP_TRIGGER_COUNT; i++)
+    {
+        cJSON *item = cJSON_CreateObject();
+        if (item == NULL)
+        {
+            goto oom;
+        }
+        if (!cJSON_AddItemToArray(triggers, item))
+        {
+            cJSON_Delete(item);
+            goto oom;
+        }
+        if (cJSON_AddNumberToObject(item, "id", i) == NULL ||
+            !add_output_status(item, &out[APP_OUT_TRIGGER_1 + i]))
+        {
+            goto oom;
+        }
+    }
+    return send_cjson(req, root);
+
+oom:
+    cJSON_Delete(root);
+    ESP_LOGE(TAG, "Out of memory building status JSON");
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
 }
 
 /* ------------------------------------------------------------------ */
@@ -281,7 +345,7 @@ oom:
 }
 
 /* ------------------------------------------------------------------ */
-/* POST /api/boil   body {"min": 70, "max": 80}                         */
+/* POST /api/boil   body {"min": 70, "max": 80}   (degC)                */
 /* Rules: whole numbers, 0 <= min/max <= 80, max > min                 */
 /* ------------------------------------------------------------------ */
 
@@ -318,8 +382,8 @@ static esp_err_t boil_post_handler(httpd_req_t *req)
 }
 
 /* ------------------------------------------------------------------ */
-/* POST /api/trigger  body {"id": 0, "min": 30, "max": 80}              */
-/* Rules: whole numbers, 0 <= min/max <= 100, max > min                */
+/* POST /api/trigger  body {"id": 0, "min": 30, "max": 80}   (% SoC)    */
+/* Rules: whole numbers, 20 <= min/max <= 100, max > min               */
 /* ------------------------------------------------------------------ */
 
 static esp_err_t trigger_post_handler(httpd_req_t *req)
@@ -380,6 +444,7 @@ static const httpd_uri_t s_uris[] = {
     { .uri = "/",             .method = HTTP_GET,  .handler = index_get_handler,       .user_ctx = NULL },
     { .uri = "/index.html",   .method = HTTP_GET,  .handler = index_get_handler,       .user_ctx = NULL },
     { .uri = "/temperature",  .method = HTTP_GET,  .handler = temperature_get_handler, .user_ctx = NULL },
+    { .uri = "/api/status",   .method = HTTP_GET,  .handler = status_get_handler,      .user_ctx = NULL },
     { .uri = "/api/settings", .method = HTTP_GET,  .handler = settings_get_handler,    .user_ctx = NULL },
     { .uri = "/api/boil",     .method = HTTP_POST, .handler = boil_post_handler,       .user_ctx = NULL },
     { .uri = "/api/trigger",  .method = HTTP_POST, .handler = trigger_post_handler,    .user_ctx = NULL },
