@@ -2,7 +2,8 @@
 #define BMS_H
 
 #include "esp_err.h"
-#include "driver/uart.h"
+#include "driver/gpio.h"    /* GPIO_NUM_x */
+#include "driver/uart.h"    /* UART_NUM_x */
 
 /* JK BMS link: UART2, TX = GPIO17, RX = GPIO16 (readme pin plan), 8N1.
  * Baud rate, address, register and RS485 DE pin: menuconfig -> BMS IO Automation -> JK BMS. */
