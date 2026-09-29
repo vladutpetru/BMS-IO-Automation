@@ -42,7 +42,11 @@ menu "BMS IO Automation"
             range 0x0 0xFFFF
             default 0x12A6
             help
-                JK-PB "BMS RS485 Modbus V1.x": SoC is the low byte of holding register 0x12A6.
+                Must be the register the device on the bus uses for battery SoC:
+                  JK-PB BMS (RS485 Modbus V1.x) ..... 0x12A6 (SoC in the low byte)
+                  Deye hybrid, older single-phase ... 0x00B8 (184)
+                  Deye hybrid, three-phase / newer .. 0x024C (588)
+                The STM32 reference used E_BaterrySOC from its Deye register enum (main.h).
 
         config APP_BMS_SOC_MASK
             hex "SoC bit mask within the register"
@@ -67,7 +71,10 @@ menu "BMS IO Automation"
         config APP_BMS_RESPONSE_TIMEOUT_MS
             int "Response timeout (ms)"
             range 20 2000
-            default 300
+            default 800
+            help
+                How long to wait for the first byte of the answer. Must be shorter than the
+                poll period (minus 20 ms); the build fails otherwise.
 
     endmenu
 

@@ -10,8 +10,9 @@
 
 static const char *TAG = "APP_STATE";
 
-/* NVS keys must be <= 15 characters */
-#define NVS_KEY_BOILER "boiler"
+/* NVS keys must be <= 15 characters (the old "boiler" key is no longer used) */
+#define NVS_KEY_BOIL_TMAX "boil_tmax"
+#define NVS_KEY_BOIL_SOC  "boil_soc"
 
 /* Display names of the triggers - rename them here */
 static const char *const s_trigger_names[APP_TRIGGER_COUNT] = { "Trigger 1", "Trigger 2", "Trigger 3" };
@@ -19,7 +20,8 @@ static const char *const s_trigger_names[APP_TRIGGER_COUNT] = { "Trigger 1", "Tr
 static const char *const s_trigger_keys[APP_TRIGGER_COUNT]  = { "trigger_0", "trigger_1", "trigger_2" };
 
 static SemaphoreHandle_t s_lock = NULL;
-static app_trigger_t s_boiler = { APP_BOIL_DEFAULT_MIN, APP_BOIL_DEFAULT_MAX };
+static int           s_boil_max_temp = APP_BOIL_TEMP_DEFAULT_MAX;
+static app_trigger_t s_boil_soc = { APP_BOIL_SOC_DEFAULT_MIN, APP_BOIL_SOC_DEFAULT_MAX };
 static app_trigger_t s_triggers[APP_TRIGGER_COUNT];
 
 /* Live values shared between tasks: each lives in ONE aligned 32-bit word, which the ESP32
@@ -47,18 +49,48 @@ static void unpack_pair(uint32_t packed, app_trigger_t *t)
     t->max = (int)(packed & 0xFF);
 }
 
-static bool trigger_is_valid(int min, int max)
+/* SoC window: used by the triggers and the boiler */
+static bool soc_pair_is_valid(int min, int max)
 {
-    return min >= APP_TRIGGER_LIMIT_MIN && min <= APP_TRIGGER_LIMIT_MAX &&
-           max >= APP_TRIGGER_LIMIT_MIN && max <= APP_TRIGGER_LIMIT_MAX &&
+    return min >= APP_SOC_LIMIT_MIN && min <= APP_SOC_LIMIT_MAX &&
+           max >= APP_SOC_LIMIT_MIN && max <= APP_SOC_LIMIT_MAX &&
            max > min;
 }
 
-static bool boil_is_valid(int min, int max)
+static bool boil_temp_is_valid(int max_c)
 {
-    return min >= APP_BOIL_LIMIT_MIN && min <= APP_BOIL_LIMIT_MAX &&
-           max >= APP_BOIL_LIMIT_MIN && max <= APP_BOIL_LIMIT_MAX &&
-           max > min;
+    return max_c >= APP_BOIL_TEMP_LIMIT_MIN && max_c <= APP_BOIL_TEMP_LIMIT_MAX;
+}
+
+/* Loads a single u32 value; a missing key gets the default written, an invalid one falls back */
+static int load_value(const char *key, int def, bool (*is_valid)(int))
+{
+    uint32_t value = 0;
+    esp_err_t err = NVS_Read(key, APP_NVS_U32, &value, NULL);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        ESP_LOGI(TAG, "'%s' not stored yet, writing default %d", key, def);
+        value = (uint32_t)def;
+        err = NVS_Write(key, APP_NVS_U32, &value, sizeof(value));
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Could not store default for '%s' (%s)", key, esp_err_to_name(err));
+        }
+        return def;
+    }
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Reading '%s' failed (%s), using default", key, esp_err_to_name(err));
+        return def;
+    }
+    if (value > 0xFFFFu || !is_valid((int)value))
+    {
+        ESP_LOGW(TAG, "'%s' holds %lu, outside the allowed range - using default %d",
+                 key, (unsigned long)value, def);
+        return def;
+    }
+    return (int)value;
 }
 
 /* Loads a packed min/max pair; a missing key gets the default written, an invalid one falls back */
@@ -140,17 +172,18 @@ esp_err_t app_state_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    const app_trigger_t boil_def = { APP_BOIL_DEFAULT_MIN, APP_BOIL_DEFAULT_MAX };
-    s_boiler = load_pair(NVS_KEY_BOILER, boil_def, boil_is_valid);
+    s_boil_max_temp = load_value(NVS_KEY_BOIL_TMAX, APP_BOIL_TEMP_DEFAULT_MAX, boil_temp_is_valid);
+    const app_trigger_t boil_soc_def = { APP_BOIL_SOC_DEFAULT_MIN, APP_BOIL_SOC_DEFAULT_MAX };
+    s_boil_soc = load_pair(NVS_KEY_BOIL_SOC, boil_soc_def, soc_pair_is_valid);
 
     const app_trigger_t trig_def = { APP_TRIGGER_DEFAULT_MIN, APP_TRIGGER_DEFAULT_MAX };
     for (int i = 0; i < APP_TRIGGER_COUNT; i++)
     {
-        s_triggers[i] = load_pair(s_trigger_keys[i], trig_def, trigger_is_valid);
+        s_triggers[i] = load_pair(s_trigger_keys[i], trig_def, soc_pair_is_valid);
     }
 
-    ESP_LOGI(TAG, "Loaded: boiler %d-%d C, triggers %d-%d / %d-%d / %d-%d %% SoC",
-             s_boiler.min, s_boiler.max,
+    ESP_LOGI(TAG, "Loaded: boiler max %d C at SoC %d-%d %%, triggers %d-%d / %d-%d / %d-%d %% SoC",
+             s_boil_max_temp, s_boil_soc.min, s_boil_soc.max,
              s_triggers[0].min, s_triggers[0].max,
              s_triggers[1].min, s_triggers[1].max,
              s_triggers[2].min, s_triggers[2].max);
@@ -230,34 +263,77 @@ void app_state_get_outputs(app_output_status_t status[APP_OUT_COUNT])
 /* Boiler                                                              */
 /* ------------------------------------------------------------------ */
 
-esp_err_t app_state_get_boil(app_trigger_t *out)
+int app_state_get_boil_max_temp(void)
 {
-    if (out == NULL)
+    if (s_lock == NULL)
     {
-        return ESP_ERR_INVALID_ARG;
+        return s_boil_max_temp;
     }
-    read_pair(&s_boiler, out);
-    return ESP_OK;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int value = s_boil_max_temp;
+    xSemaphoreGive(s_lock);
+    return value;
 }
 
-esp_err_t app_state_set_boil(int min, int max)
+esp_err_t app_state_set_boil_max_temp(int max_c)
 {
     if (s_lock == NULL)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!boil_is_valid(min, max))
+    if (!boil_temp_is_valid(max_c))
     {
         return ESP_ERR_INVALID_ARG;
     }
-    esp_err_t err = save_pair(NVS_KEY_BOILER, &s_boiler, min, max);
+    uint32_t value = (uint32_t)max_c;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    /* Persist first; RAM is only updated if the flash write succeeded */
+    esp_err_t err = NVS_Write(NVS_KEY_BOIL_TMAX, APP_NVS_U32, &value, sizeof(value));
     if (err == ESP_OK)
     {
-        ESP_LOGI(TAG, "Boiler set to %d-%d C", min, max);
+        s_boil_max_temp = max_c;
+    }
+    xSemaphoreGive(s_lock);
+
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Boiler max temperature set to %d C", max_c);
     }
     else
     {
-        ESP_LOGE(TAG, "Saving boiler min/max failed (%s)", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Saving boiler max temperature failed (%s)", esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t app_state_get_boil_soc(app_trigger_t *out)
+{
+    if (out == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    read_pair(&s_boil_soc, out);
+    return ESP_OK;
+}
+
+esp_err_t app_state_set_boil_soc(int min, int max)
+{
+    if (s_lock == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!soc_pair_is_valid(min, max))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = save_pair(NVS_KEY_BOIL_SOC, &s_boil_soc, min, max);
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Boiler SoC window set to %d-%d %%", min, max);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Saving boiler SoC window failed (%s)", esp_err_to_name(err));
     }
     return err;
 }
@@ -286,7 +362,7 @@ esp_err_t app_state_set_trigger(int id, int min, int max)
     {
         return ESP_ERR_NOT_FOUND;
     }
-    if (!trigger_is_valid(min, max))
+    if (!soc_pair_is_valid(min, max))
     {
         return ESP_ERR_INVALID_ARG;
     }

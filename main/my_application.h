@@ -14,7 +14,7 @@
 #define ACTION_PIN_COUNT 4
 
 /* Roles of the action outputs */
-#define BOILER_PIN     ACTION_PIN_1   /* ON below boiler min temp, OFF at/above boiler max temp */
+#define BOILER_PIN     ACTION_PIN_1   /* ON while temp < boiler max AND SoC inside the boiler SoC window */
 #define TRIGGER_1_PIN  ACTION_PIN_2   /* ON while battery SoC is inside trigger 1 min..max */
 #define TRIGGER_2_PIN  ACTION_PIN_3   /* ON while battery SoC is inside trigger 2 min..max */
 #define TRIGGER_3_PIN  ACTION_PIN_4   /* ON while battery SoC is inside trigger 3 min..max */

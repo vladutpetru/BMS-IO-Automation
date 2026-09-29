@@ -16,10 +16,16 @@ static const char *TAG = "BMS";
 #define MB_RESP_LEN_1REG     7     /* addr, fc, byte count (2), value hi, value lo, crc lo, crc hi */
 #define MB_EXC_LEN           5     /* addr, fc | 0x80, exception code, crc lo, crc hi */
 
-#define BMS_RX_BUF_SIZE      256   /* must be larger than the 128-byte UART hardware FIFO */
+#define BMS_RX_BUF_SIZE      256   /* driver ring buffer, must be larger than the 128-byte UART FIFO */
+#define BMS_FRAME_MAX        64    /* bytes collected per answer (reply + possible echo/noise) */
+#define BMS_FRAME_GAP_MS     20    /* silence that ends a frame (STM32 used 5 ms; FreeRTOS tick is 10 ms) */
 #define BMS_STALE_POLLS      10    /* SoC marked unavailable after this many failed polls in a row */
+#define BMS_REPEAT_LOG_POLLS 60    /* while failing, log the raw bytes again every this many polls */
 #define BMS_TASK_STACK       3072
 #define BMS_TASK_PRIO        9
+
+_Static_assert(CONFIG_APP_BMS_RESPONSE_TIMEOUT_MS + BMS_FRAME_GAP_MS < CONFIG_APP_BMS_POLL_MS,
+               "response timeout must be shorter than the poll period");
 
 /* Modbus RTU CRC-16 (poly 0xA001 reflected, init 0xFFFF), sent low byte first */
 static uint16_t modbus_crc16(const uint8_t *data, size_t len)
@@ -34,6 +40,26 @@ static uint16_t modbus_crc16(const uint8_t *data, size_t len)
         }
     }
     return crc;
+}
+
+static bool crc_ok(const uint8_t *frame, size_t len_with_crc)
+{
+    uint16_t rx = (uint16_t)(frame[len_with_crc - 2] | (frame[len_with_crc - 1] << 8));
+    return modbus_crc16(frame, len_with_crc - 2) == rx;
+}
+
+/* Same frame as GenerateReadRequest() in the STM32 project: read 1 holding register */
+static void build_request(uint8_t req[MB_REQ_LEN], uint8_t slave, uint16_t reg)
+{
+    req[0] = slave;
+    req[1] = MB_FC_READ_HOLDING;
+    req[2] = (uint8_t)(reg >> 8);
+    req[3] = (uint8_t)(reg & 0xFF);
+    req[4] = 0x00;                  /* number of registers - high byte */
+    req[5] = 0x01;                  /* number of registers - low byte */
+    uint16_t crc = modbus_crc16(req, 6);
+    req[6] = (uint8_t)(crc & 0xFF);
+    req[7] = (uint8_t)(crc >> 8);
 }
 
 static esp_err_t uart_setup(void)
@@ -88,17 +114,75 @@ static esp_err_t uart_setup(void)
     return ESP_OK;
 }
 
-/* Modbus RTU "read holding registers" for ONE register. Blocks up to the response timeout. */
-static esp_err_t read_holding_register(uint8_t slave, uint16_t reg, uint16_t *value)
+/* Collects one answer like the STM32 did: wait up to the response timeout for the first
+ * byte, then keep reading until the line has been silent for BMS_FRAME_GAP_MS.
+ * Returns the number of bytes received (0 = no answer), or -1 on a driver error. */
+static int receive_frame(uint8_t *buf, size_t size)
 {
-    uint8_t req[MB_REQ_LEN] = {
-        slave, MB_FC_READ_HOLDING,
-        (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF),
-        0x00, 0x01,                 /* number of registers */
-    };
-    uint16_t crc = modbus_crc16(req, 6);
-    req[6] = (uint8_t)(crc & 0xFF);
-    req[7] = (uint8_t)(crc >> 8);
+    int n = uart_read_bytes(BMS_UART_PORT, buf, 1, pdMS_TO_TICKS(CONFIG_APP_BMS_RESPONSE_TIMEOUT_MS));
+    if (n <= 0)
+    {
+        return n;
+    }
+
+    TickType_t gap = pdMS_TO_TICKS(BMS_FRAME_GAP_MS);
+    if (gap == 0)
+    {
+        gap = 1;
+    }
+    size_t got = (size_t)n;
+    while (got < size)
+    {
+        n = uart_read_bytes(BMS_UART_PORT, buf + got, size - got, gap);
+        if (n < 0)
+        {
+            return -1;
+        }
+        if (n == 0)
+        {
+            break;                  /* line silent: frame complete */
+        }
+        got += (size_t)n;
+    }
+    return (int)got;
+}
+
+/* Searches the received bytes for a valid answer from `slave`. Stray bytes before the answer
+ * (a turn-around glitch, or an echo of our own request) are skipped. */
+static esp_err_t parse_answer(const uint8_t *buf, size_t len, uint8_t slave, uint16_t *value)
+{
+    for (size_t i = 0; i + MB_EXC_LEN <= len; i++)
+    {
+        /* Address 0 is what the reference project used; accept whatever address answers then */
+        if (slave != 0 && buf[i] != slave)
+        {
+            continue;
+        }
+        if (buf[i + 1] == MB_FC_READ_HOLDING && buf[i + 2] == 2 &&
+            i + MB_RESP_LEN_1REG <= len && crc_ok(&buf[i], MB_RESP_LEN_1REG))
+        {
+            if (i > 0)
+            {
+                ESP_LOGD(TAG, "Skipped %u stray byte(s) before the answer", (unsigned)i);
+            }
+            *value = (uint16_t)((buf[i + 3] << 8) | buf[i + 4]);
+            return ESP_OK;
+        }
+        if (buf[i + 1] == (MB_FC_READ_HOLDING | 0x80) && crc_ok(&buf[i], MB_EXC_LEN))
+        {
+            ESP_LOGW(TAG, "Device answered with Modbus exception %u%s", buf[i + 2],
+                     buf[i + 2] == 2 ? " (illegal data address: wrong register for this device)" : "");
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+    return ESP_ERR_INVALID_CRC;     /* bytes arrived, but no valid frame among them */
+}
+
+/* One request/answer cycle. rx/rx_len return the raw answer for diagnostics. */
+static esp_err_t read_holding_register(const uint8_t req[MB_REQ_LEN], uint8_t slave,
+                                       uint16_t *value, uint8_t *rx, int *rx_len)
+{
+    *rx_len = 0;
 
     /* Drop leftovers of an earlier, late or broken answer */
     esp_err_t err = uart_flush_input(BMS_UART_PORT);
@@ -108,10 +192,10 @@ static esp_err_t read_holding_register(uint8_t slave, uint16_t reg, uint16_t *va
         return err;
     }
 
-    int written = uart_write_bytes(BMS_UART_PORT, req, sizeof(req));
-    if (written != (int)sizeof(req))
+    int written = uart_write_bytes(BMS_UART_PORT, req, MB_REQ_LEN);
+    if (written != MB_REQ_LEN)
     {
-        ESP_LOGE(TAG, "uart_write_bytes wrote %d of %u bytes", written, (unsigned)sizeof(req));
+        ESP_LOGE(TAG, "uart_write_bytes wrote %d of %d bytes", written, MB_REQ_LEN);
         return ESP_FAIL;
     }
     err = uart_wait_tx_done(BMS_UART_PORT, pdMS_TO_TICKS(100));
@@ -121,83 +205,63 @@ static esp_err_t read_holding_register(uint8_t slave, uint16_t reg, uint16_t *va
         return err;
     }
 
-    /* Read until the frame is complete: 7 bytes normally, 5 for an exception answer */
-    uint8_t resp[MB_RESP_LEN_1REG];
-    size_t got = 0;
-    size_t expected = MB_RESP_LEN_1REG;
-    const TickType_t timeout = pdMS_TO_TICKS(CONFIG_APP_BMS_RESPONSE_TIMEOUT_MS);
-    const TickType_t start = xTaskGetTickCount();
+    int n = receive_frame(rx, BMS_FRAME_MAX);
+    if (n < 0)
+    {
+        ESP_LOGE(TAG, "uart_read_bytes failed");
+        return ESP_FAIL;
+    }
+    *rx_len = n;
+    if (n == 0)
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+    return parse_answer(rx, (size_t)n, slave, value);
+}
 
-    while (got < expected)
+static void log_failure(esp_err_t err, const uint8_t *rx, int rx_len, uint32_t fails)
+{
+    if (err == ESP_ERR_TIMEOUT)
     {
-        TickType_t elapsed = xTaskGetTickCount() - start;
-        if (elapsed >= timeout)
-        {
-            break;
-        }
-        int n = uart_read_bytes(BMS_UART_PORT, resp + got, expected - got, timeout - elapsed);
-        if (n < 0)
-        {
-            ESP_LOGE(TAG, "uart_read_bytes failed");
-            return ESP_FAIL;
-        }
-        got += (size_t)n;
-        if (got >= 2 && (resp[1] & 0x80))
-        {
-            expected = MB_EXC_LEN;
-        }
+        ESP_LOGW(TAG, "No answer within %d ms (failed polls: %lu) - check wiring (TX2/RX2 swap, A/B swap), "
+                      "baud rate and address", CONFIG_APP_BMS_RESPONSE_TIMEOUT_MS, (unsigned long)fails);
+        return;
     }
-
-    if (got < expected)
+    ESP_LOGW(TAG, "Invalid answer (%s), %d byte(s) received (failed polls: %lu):",
+             esp_err_to_name(err), rx_len, (unsigned long)fails);
+    if (rx_len > 0)
     {
-        return (got == 0) ? ESP_ERR_TIMEOUT : ESP_ERR_INVALID_SIZE;
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, rx, rx_len, ESP_LOG_WARN);
     }
-
-    uint16_t crc_rx = (uint16_t)(resp[expected - 2] | (resp[expected - 1] << 8));
-    if (modbus_crc16(resp, expected - 2) != crc_rx)
-    {
-        return ESP_ERR_INVALID_CRC;
-    }
-    /* Address 0 is what the reference project used; accept whatever address answers then */
-    if (slave != 0 && resp[0] != slave)
-    {
-        ESP_LOGW(TAG, "Answer from address %u, expected %u", resp[0], slave);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    if (resp[1] & 0x80)
-    {
-        ESP_LOGW(TAG, "BMS returned Modbus exception %u", resp[2]);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    if (resp[1] != MB_FC_READ_HOLDING || resp[2] != 2)
-    {
-        ESP_LOGW(TAG, "Unexpected answer: function 0x%02X, %u data bytes", resp[1], resp[2]);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    *value = (uint16_t)((resp[3] << 8) | resp[4]);
-    return ESP_OK;
 }
 
 static void bms_task(void *arg)
 {
     (void)arg;
+    const uint8_t slave = CONFIG_APP_BMS_SLAVE_ID;
     const uint16_t mask = CONFIG_APP_BMS_SOC_MASK;
     const int shift = __builtin_ctz(mask);
-    int fails = 0;
+    uint8_t req[MB_REQ_LEN];
+    uint8_t rx[BMS_FRAME_MAX];
+    uint32_t fails = 0;
     int last_soc = -1;
     TickType_t last_wake = xTaskGetTickCount();
+
+    build_request(req, slave, CONFIG_APP_BMS_SOC_REGISTER);
+    ESP_LOGI(TAG, "Request frame (compare with the STM32 RequestBuffer):");
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, req, MB_REQ_LEN, ESP_LOG_INFO);
 
     while (1)
     {
         uint16_t reg = 0;
-        esp_err_t err = read_holding_register(CONFIG_APP_BMS_SLAVE_ID, CONFIG_APP_BMS_SOC_REGISTER, &reg);
+        int rx_len = 0;
+        esp_err_t err = read_holding_register(req, slave, &reg, rx, &rx_len);
         if (err == ESP_OK)
         {
             int soc = (reg & mask) >> shift;
             if (soc > 100)
             {
-                ESP_LOGW(TAG, "Implausible SoC %d (register 0x%04X) - check register and mask", soc, reg);
+                ESP_LOGW(TAG, "Implausible SoC %d (register value 0x%04X) - check register and mask", soc, reg);
                 err = ESP_ERR_INVALID_RESPONSE;
             }
             else
@@ -210,7 +274,7 @@ static void bms_task(void *arg)
                 app_state_set_soc(soc);
                 if (soc != last_soc)
                 {
-                    ESP_LOGI(TAG, "SoC %d %%", soc);
+                    ESP_LOGI(TAG, "SoC %d %% (register value 0x%04X)", soc, reg);
                     last_soc = soc;
                 }
             }
@@ -218,19 +282,18 @@ static void bms_task(void *arg)
 
         if (err != ESP_OK)
         {
-            if (fails < BMS_STALE_POLLS)
+            fails++;
+            /* Log the first failure, the moment the SoC goes stale, then once a minute */
+            if (fails == 1 || fails == BMS_STALE_POLLS || (fails % BMS_REPEAT_LOG_POLLS) == 0)
             {
-                fails++;
-                if (fails == 1)
-                {
-                    ESP_LOGW(TAG, "SoC read failed (%s)", esp_err_to_name(err));
-                }
-                if (fails == BMS_STALE_POLLS)
-                {
-                    ESP_LOGE(TAG, "No valid SoC for %d polls - SoC unavailable, triggers OFF", BMS_STALE_POLLS);
-                    app_state_invalidate_soc();
-                    last_soc = -1;
-                }
+                log_failure(err, rx, rx_len, fails);
+            }
+            if (fails == BMS_STALE_POLLS)
+            {
+                ESP_LOGE(TAG, "No valid SoC for %d polls - SoC unavailable, boiler and triggers OFF",
+                         BMS_STALE_POLLS);
+                app_state_invalidate_soc();
+                last_soc = -1;
             }
         }
 
@@ -250,8 +313,8 @@ esp_err_t bms_start(void)
         ESP_LOGE(TAG, "Failed to create BMS task");
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "Polling address %d, register 0x%04X, mask 0x%04X every %d ms",
-             CONFIG_APP_BMS_SLAVE_ID, CONFIG_APP_BMS_SOC_REGISTER, CONFIG_APP_BMS_SOC_MASK,
-             CONFIG_APP_BMS_POLL_MS);
+    ESP_LOGI(TAG, "Polling address %d, register %d (0x%04X), mask 0x%04X every %d ms, timeout %d ms",
+             CONFIG_APP_BMS_SLAVE_ID, CONFIG_APP_BMS_SOC_REGISTER, CONFIG_APP_BMS_SOC_REGISTER,
+             CONFIG_APP_BMS_SOC_MASK, CONFIG_APP_BMS_POLL_MS, CONFIG_APP_BMS_RESPONSE_TIMEOUT_MS);
     return ESP_OK;
 }

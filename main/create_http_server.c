@@ -281,28 +281,31 @@ oom:
 
 /* ------------------------------------------------------------------ */
 /* GET /api/settings                                                   */
-/* {"boiler":{"min":70,"max":80},                                      */
+/* {"boiler":{"max_temp":80,"soc":{"min":20,"max":100}},               */
 /*  "triggers":[{"id":0,"name":"Trigger 1","min":20,"max":100},..]}    */
 /* ------------------------------------------------------------------ */
 
 static esp_err_t settings_get_handler(httpd_req_t *req)
 {
-    app_trigger_t boil;
-    esp_err_t err = app_state_get_boil(&boil);
+    app_trigger_t boil_soc;
+    esp_err_t err = app_state_get_boil_soc(&boil_soc);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Reading boiler min/max failed (%s)", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Reading boiler SoC window failed (%s)", esp_err_to_name(err));
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read settings");
     }
 
     cJSON *root = cJSON_CreateObject();
     cJSON *boiler = NULL;
+    cJSON *soc = NULL;
     cJSON *triggers = NULL;
 
     if (root == NULL ||
         (boiler = cJSON_AddObjectToObject(root, "boiler")) == NULL ||
-        cJSON_AddNumberToObject(boiler, "min", boil.min) == NULL ||
-        cJSON_AddNumberToObject(boiler, "max", boil.max) == NULL ||
+        cJSON_AddNumberToObject(boiler, "max_temp", app_state_get_boil_max_temp()) == NULL ||
+        (soc = cJSON_AddObjectToObject(boiler, "soc")) == NULL ||
+        cJSON_AddNumberToObject(soc, "min", boil_soc.min) == NULL ||
+        cJSON_AddNumberToObject(soc, "max", boil_soc.max) == NULL ||
         (triggers = cJSON_AddArrayToObject(root, "triggers")) == NULL)
     {
         goto oom;
@@ -345,11 +348,57 @@ oom:
 }
 
 /* ------------------------------------------------------------------ */
-/* POST /api/boil   body {"min": 70, "max": 80}   (degC)                */
-/* Rules: whole numbers, 0 <= min/max <= 80, max > min                 */
+/* POST /api/boil_temp   body {"max": 78}   (degC)                      */
+/* Rules: whole number, 0..80                                          */
 /* ------------------------------------------------------------------ */
 
-static esp_err_t boil_post_handler(httpd_req_t *req)
+static esp_err_t boil_temp_post_handler(httpd_req_t *req)
+{
+    cJSON *root;
+    if (read_json_body(req, &root) != ESP_OK)
+    {
+        return ESP_FAIL;
+    }
+
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "max");
+    if (!cJSON_IsNumber(item))
+    {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body needs numeric \"max\"");
+    }
+    double v = item->valuedouble;
+    cJSON_Delete(root);
+
+    if (v != floor(v) || v < APP_BOIL_TEMP_LIMIT_MIN || v > APP_BOIL_TEMP_LIMIT_MAX)
+    {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "\"max\" must be a whole number from %d to %d",
+                 APP_BOIL_TEMP_LIMIT_MIN, APP_BOIL_TEMP_LIMIT_MAX);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+    }
+
+    int max_c = (int)v;
+    esp_err_t err = app_state_set_boil_max_temp(max_c);
+    if (err == ESP_ERR_INVALID_ARG)
+    {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Value out of range");
+    }
+    if (err != ESP_OK)
+    {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save to flash");
+    }
+
+    char json[24];
+    snprintf(json, sizeof(json), "{\"max\":%d}", max_c);
+    return send_json(req, json);
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /api/boil_soc   body {"min": 40, "max": 100}   (% SoC)          */
+/* Rules: whole numbers, 20 <= min/max <= 100, max > min               */
+/* ------------------------------------------------------------------ */
+
+static esp_err_t boil_soc_post_handler(httpd_req_t *req)
 {
     cJSON *root;
     if (read_json_body(req, &root) != ESP_OK)
@@ -359,14 +408,14 @@ static esp_err_t boil_post_handler(httpd_req_t *req)
 
     int min, max;
     char msg[64];
-    bool ok = parse_min_max(root, APP_BOIL_LIMIT_MIN, APP_BOIL_LIMIT_MAX, &min, &max, msg, sizeof(msg));
+    bool ok = parse_min_max(root, APP_SOC_LIMIT_MIN, APP_SOC_LIMIT_MAX, &min, &max, msg, sizeof(msg));
     cJSON_Delete(root);
     if (!ok)
     {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
     }
 
-    esp_err_t err = app_state_set_boil(min, max);
+    esp_err_t err = app_state_set_boil_soc(min, max);
     if (err == ESP_ERR_INVALID_ARG)
     {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid min/max");
@@ -446,7 +495,8 @@ static const httpd_uri_t s_uris[] = {
     { .uri = "/temperature",  .method = HTTP_GET,  .handler = temperature_get_handler, .user_ctx = NULL },
     { .uri = "/api/status",   .method = HTTP_GET,  .handler = status_get_handler,      .user_ctx = NULL },
     { .uri = "/api/settings", .method = HTTP_GET,  .handler = settings_get_handler,    .user_ctx = NULL },
-    { .uri = "/api/boil",     .method = HTTP_POST, .handler = boil_post_handler,       .user_ctx = NULL },
+    { .uri = "/api/boil_temp", .method = HTTP_POST, .handler = boil_temp_post_handler, .user_ctx = NULL },
+    { .uri = "/api/boil_soc",  .method = HTTP_POST, .handler = boil_soc_post_handler,  .user_ctx = NULL },
     { .uri = "/api/trigger",  .method = HTTP_POST, .handler = trigger_post_handler,    .user_ctx = NULL },
 };
 #define URI_COUNT (sizeof(s_uris) / sizeof(s_uris[0]))

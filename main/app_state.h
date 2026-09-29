@@ -4,19 +4,23 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-/* Triggers chapter: 3 triggers on the battery SoC (%), min/max in 20..100, max > min */
+/* SoC windows (triggers and boiler): whole %, 20..100, max > min */
+#define APP_SOC_LIMIT_MIN        20
+#define APP_SOC_LIMIT_MAX        100
+
+/* Triggers chapter: 3 triggers on the battery SoC */
 #define APP_TRIGGER_COUNT        3
-#define APP_TRIGGER_LIMIT_MIN    20
-#define APP_TRIGGER_LIMIT_MAX    100
+#define APP_TRIGGER_LIMIT_MIN    APP_SOC_LIMIT_MIN
+#define APP_TRIGGER_LIMIT_MAX    APP_SOC_LIMIT_MAX
 #define APP_TRIGGER_DEFAULT_MIN  20
 #define APP_TRIGGER_DEFAULT_MAX  100
 
-/* Boiler chapter: thermostat band in whole degC, 0..80, max > min.
- * Boiler ON below min, OFF at/above max, unchanged in between. */
-#define APP_BOIL_LIMIT_MIN    0
-#define APP_BOIL_LIMIT_MAX    80
-#define APP_BOIL_DEFAULT_MIN  70
-#define APP_BOIL_DEFAULT_MAX  80
+/* Boiler chapter: ON while temperature < max temperature AND SoC inside [soc min, soc max] */
+#define APP_BOIL_TEMP_LIMIT_MIN    0       /* whole degC */
+#define APP_BOIL_TEMP_LIMIT_MAX    80
+#define APP_BOIL_TEMP_DEFAULT_MAX  80
+#define APP_BOIL_SOC_DEFAULT_MIN   20
+#define APP_BOIL_SOC_DEFAULT_MAX   100
 
 typedef struct
 {
@@ -58,9 +62,13 @@ bool app_state_get_soc(int *soc);                      /* false while no valid S
 void app_state_set_outputs(const app_output_status_t status[APP_OUT_COUNT]);
 void app_state_get_outputs(app_output_status_t status[APP_OUT_COUNT]);
 
-/* Boiler min/max (persisted) */
-esp_err_t app_state_get_boil(app_trigger_t *out);
-esp_err_t app_state_set_boil(int min, int max);        /* ESP_ERR_INVALID_ARG if invalid */
+/* Boiler maximum temperature in whole degC (persisted) */
+int       app_state_get_boil_max_temp(void);
+esp_err_t app_state_set_boil_max_temp(int max_c);      /* ESP_ERR_INVALID_ARG if out of range */
+
+/* Boiler SoC window in % (persisted) */
+esp_err_t app_state_get_boil_soc(app_trigger_t *out);
+esp_err_t app_state_set_boil_soc(int min, int max);    /* ESP_ERR_INVALID_ARG if invalid */
 
 /* Triggers (persisted) */
 esp_err_t   app_state_get_trigger(int id, app_trigger_t *out);   /* ESP_ERR_NOT_FOUND for a bad id */

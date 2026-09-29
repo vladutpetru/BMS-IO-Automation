@@ -20,6 +20,10 @@ static const char *APP_TAG = "MY_APP";
 #define TEMP_PLAUSIBLE_MIN_TENTHS  (-400)
 #define TEMP_PLAUSIBLE_MAX_TENTHS  1250
 
+/* Boiler: OFF as soon as temp >= max; allowed back ON only below (max - 1.0 C),
+ * so it cannot cycle every minute while the water sits right at the maximum. */
+#define BOIL_RESTART_HYST_TENTHS   10
+
 #define DWELL_TICKS  pdMS_TO_TICKS(OUTPUT_MIN_DWELL_S * 1000)
 
 _Static_assert(APP_OUT_COUNT == ACTION_PIN_COUNT, "one output per action pin");
@@ -35,6 +39,7 @@ static bool       s_out_off_now[APP_OUT_COUNT];    /* safety: switch OFF without
 static TickType_t s_last_change[APP_OUT_COUNT];    /* tick of the last pin change */
 
 static bool s_temp_fault = false;
+static bool s_boil_temp_ok = false;     /* temperature part of the boiler decision (with hysteresis) */
 static bool s_soc_fault = false;
 static int  s_last_temp_tenths = 0;
 static int  s_last_soc = 0;
@@ -104,21 +109,35 @@ void my_app_init(void)
 /* Control logic                                                       */
 /* ------------------------------------------------------------------ */
 
-/* Thermostat: ON below min, OFF at/above max, unchanged in between */
-static bool boiler_should_run(int temp, int min, int max, bool running)
+/* Reads the SoC once per cycle; logs loss/recovery. Returns false while no SoC is available. */
+static bool read_soc(int *soc)
 {
-    if (temp >= max)
+    if (!app_state_get_soc(soc))
     {
+        if (!s_soc_fault)
+        {
+            ESP_LOGE(APP_TAG, "No battery SoC from the BMS - boiler and triggers OFF");
+            s_soc_fault = true;
+        }
         return false;
     }
-    if (temp < min)
+    if (s_soc_fault)
     {
-        return true;
+        ESP_LOGI(APP_TAG, "Battery SoC available again (%d %%)", *soc);
+        s_soc_fault = false;
     }
-    return running;
+    s_last_soc = *soc;
+    return true;
 }
 
-static void control_boiler(void)
+static void boiler_off_now(void)
+{
+    s_out_want[APP_OUT_BOILER] = false;
+    s_out_off_now[APP_OUT_BOILER] = true;
+}
+
+/* Boiler: ON while temp < max temperature AND SoC inside [soc min, soc max] */
+static void control_boiler(bool have_soc, int soc)
 {
     int temp;
     bool have_temp = app_state_get_temp_tenths(&temp);
@@ -138,8 +157,8 @@ static void control_boiler(void)
             }
             s_temp_fault = true;
         }
-        s_out_want[APP_OUT_BOILER] = false;
-        s_out_off_now[APP_OUT_BOILER] = true;
+        s_boil_temp_ok = false;
+        boiler_off_now();
         return;
     }
     if (s_temp_fault)
@@ -149,34 +168,38 @@ static void control_boiler(void)
     }
     s_last_temp_tenths = temp;
 
-    app_trigger_t boil;
-    esp_err_t err = app_state_get_boil(&boil);
-    if (err != ESP_OK)
+    /* Temperature part, with restart hysteresis (max temperature is whole degC) */
+    int max_tenths = app_state_get_boil_max_temp() * 10;
+    s_boil_temp_ok = s_boil_temp_ok ? (temp < max_tenths)
+                                    : (temp < max_tenths - BOIL_RESTART_HYST_TENTHS);
+
+    /* No battery data: boiler OFF at once */
+    if (!have_soc)
     {
-        ESP_LOGE(APP_TAG, "Reading boiler min/max failed (%s) - boiler OFF", esp_err_to_name(err));
-        s_out_want[APP_OUT_BOILER] = false;
-        s_out_off_now[APP_OUT_BOILER] = true;
+        boiler_off_now();
         return;
     }
 
-    /* min/max are whole degC, temperature is in tenths */
-    s_out_want[APP_OUT_BOILER] = boiler_should_run(temp, boil.min * 10, boil.max * 10,
-                                                   s_out_want[APP_OUT_BOILER]);
+    app_trigger_t win;
+    esp_err_t err = app_state_get_boil_soc(&win);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(APP_TAG, "Reading boiler SoC window failed (%s) - boiler OFF", esp_err_to_name(err));
+        boiler_off_now();
+        return;
+    }
+
+    bool soc_ok = (soc >= win.min && soc <= win.max);
+    s_out_want[APP_OUT_BOILER] = s_boil_temp_ok && soc_ok;
     /* Overheat protection: at/above max the boiler goes OFF without waiting the dwell time */
-    s_out_off_now[APP_OUT_BOILER] = (temp >= boil.max * 10);
+    s_out_off_now[APP_OUT_BOILER] = (temp >= max_tenths);
 }
 
-static void control_triggers(void)
+static void control_triggers(bool have_soc, int soc)
 {
-    int soc;
-    if (!app_state_get_soc(&soc))
+    if (!have_soc)
     {
         /* No battery data: loads OFF at once rather than drain a battery we cannot see */
-        if (!s_soc_fault)
-        {
-            ESP_LOGE(APP_TAG, "No battery SoC from the BMS - triggers OFF");
-            s_soc_fault = true;
-        }
         for (int i = 0; i < APP_TRIGGER_COUNT; i++)
         {
             s_out_want[APP_OUT_TRIGGER_1 + i] = false;
@@ -184,12 +207,6 @@ static void control_triggers(void)
         }
         return;
     }
-    if (s_soc_fault)
-    {
-        ESP_LOGI(APP_TAG, "Battery SoC available again (%d %%)", soc);
-        s_soc_fault = false;
-    }
-    s_last_soc = soc;
 
     for (int i = 0; i < APP_TRIGGER_COUNT; i++)
     {
@@ -229,8 +246,10 @@ static void input(void)
 
 static void loop(void)
 {
-    control_boiler();
-    control_triggers();
+    int soc = 0;
+    bool have_soc = read_soc(&soc);
+    control_boiler(have_soc, soc);
+    control_triggers(have_soc, soc);
 }
 
 /* Applies the wanted states, at most one change per output per OUTPUT_MIN_DWELL_S,
@@ -261,8 +280,8 @@ static void output(void)
                 since = 0;
                 if (i == APP_OUT_BOILER)
                 {
-                    ESP_LOGI(APP_TAG, "%s (GPIO%d) -> %s at %.1f C%s", out_name(i), s_out_pins[i],
-                             s_out_applied[i] ? "ON" : "OFF", s_last_temp_tenths / 10.0,
+                    ESP_LOGI(APP_TAG, "%s (GPIO%d) -> %s at %.1f C, SoC %d %%%s", out_name(i), s_out_pins[i],
+                             s_out_applied[i] ? "ON" : "OFF", s_last_temp_tenths / 10.0, s_last_soc,
                              (safety_off && !dwell_done) ? " (immediate)" : "");
                 }
                 else
