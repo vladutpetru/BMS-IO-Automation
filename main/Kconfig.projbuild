@@ -65,6 +65,13 @@ menu "BMS IO Automation"
             range 200 10000
             default 1000
 
+        config APP_BMS_TRACE
+            bool "Log every Modbus request and answer (hex)"
+            default y
+            help
+                Prints each request sent on UART2 and the bytes received back, once per poll.
+                Useful while bringing up the BMS link; switch off afterwards to keep the log quiet.
+
         config APP_BMS_RESPONSE_TIMEOUT_MS
             int "Response timeout (ms)"
             range 20 2000

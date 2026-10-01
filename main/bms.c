@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -114,12 +115,12 @@ static esp_err_t uart_setup(void)
     return ESP_OK;
 }
 
-/* Collects one answer like the STM32 did: wait up to the response timeout for the first
+/* Collects one burst of bytes like the STM32 did: wait up to first_byte_wait for the first
  * byte, then keep reading until the line has been silent for BMS_FRAME_GAP_MS.
- * Returns the number of bytes received (0 = no answer), or -1 on a driver error. */
-static int receive_frame(uint8_t *buf, size_t size)
+ * Returns the number of bytes received (0 = nothing), or -1 on a driver error. */
+static int receive_frame(uint8_t *buf, size_t size, TickType_t first_byte_wait)
 {
-    int n = uart_read_bytes(BMS_UART_PORT, buf, 1, pdMS_TO_TICKS(CONFIG_APP_BMS_RESPONSE_TIMEOUT_MS));
+    int n = uart_read_bytes(BMS_UART_PORT, buf, 1, first_byte_wait);
     if (n <= 0)
     {
         return n;
@@ -178,11 +179,15 @@ static esp_err_t parse_answer(const uint8_t *buf, size_t len, uint8_t slave, uin
     return ESP_ERR_INVALID_CRC;     /* bytes arrived, but no valid frame among them */
 }
 
-/* One request/answer cycle. rx/rx_len return the raw answer for diagnostics. */
-static esp_err_t read_holding_register(const uint8_t req[MB_REQ_LEN], uint8_t slave,
-                                       uint16_t *value, uint8_t *rx, int *rx_len)
+/* One request/answer cycle. rx/rx_len return the raw bytes for diagnostics.
+ * Like the STM32 (which kept receiving between polls), bursts are collected for the whole
+ * response timeout: an echo of our own request from the RS485 module is skipped and a late
+ * answer after it is still found. *echo_only is set when nothing but that echo came back. */
+static esp_err_t read_holding_register(const uint8_t req[MB_REQ_LEN], uint8_t slave, uint16_t *value,
+                                       uint8_t *rx, int *rx_len, bool *echo_only)
 {
     *rx_len = 0;
+    *echo_only = false;
 
     /* Drop leftovers of an earlier, late or broken answer */
     esp_err_t err = uart_flush_input(BMS_UART_PORT);
@@ -204,23 +209,84 @@ static esp_err_t read_holding_register(const uint8_t req[MB_REQ_LEN], uint8_t sl
         ESP_LOGE(TAG, "uart_wait_tx_done failed (%s)", esp_err_to_name(err));
         return err;
     }
+    const TickType_t sent_at = xTaskGetTickCount();
 
-    int n = receive_frame(rx, BMS_FRAME_MAX);
-    if (n < 0)
+#if CONFIG_APP_BMS_TRACE
+    /* The UART driver buffers incoming bytes, so logging here loses no part of the answer */
+    ESP_LOGI(TAG, "TX %d bytes:", MB_REQ_LEN);
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, req, MB_REQ_LEN, ESP_LOG_INFO);
+#endif
+
+    const TickType_t timeout = pdMS_TO_TICKS(CONFIG_APP_BMS_RESPONSE_TIMEOUT_MS);
+    const TickType_t start = sent_at;
+    size_t total = 0;
+    esp_err_t result = ESP_ERR_TIMEOUT;
+
+    while (total < BMS_FRAME_MAX)
     {
-        ESP_LOGE(TAG, "uart_read_bytes failed");
-        return ESP_FAIL;
+        TickType_t elapsed = xTaskGetTickCount() - start;
+        if (elapsed >= timeout)
+        {
+            break;
+        }
+        int n = receive_frame(rx + total, BMS_FRAME_MAX - total, timeout - elapsed);
+        if (n < 0)
+        {
+            ESP_LOGE(TAG, "uart_read_bytes failed");
+            *rx_len = (int)total;
+            return ESP_FAIL;
+        }
+        if (n == 0)
+        {
+            break;                          /* nothing more before the timeout */
+        }
+        total += (size_t)n;
+
+        result = parse_answer(rx, total, slave, value);
+        if (result == ESP_OK || result == ESP_ERR_INVALID_RESPONSE)
+        {
+            break;                          /* valid answer, or a definite error answer */
+        }
     }
-    *rx_len = n;
-    if (n == 0)
+
+    *rx_len = (int)total;
+
+#if CONFIG_APP_BMS_TRACE
+    if (total == 0)
+    {
+        ESP_LOGI(TAG, "RX: nothing within %d ms", CONFIG_APP_BMS_RESPONSE_TIMEOUT_MS);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "RX %u bytes after %lu ms:", (unsigned)total,
+                 (unsigned long)pdTICKS_TO_MS(xTaskGetTickCount() - sent_at));
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, rx, total, ESP_LOG_INFO);
+    }
+#endif
+
+    if (total == 0)
     {
         return ESP_ERR_TIMEOUT;
     }
-    return parse_answer(rx, (size_t)n, slave, value);
+    if (result != ESP_OK && result != ESP_ERR_INVALID_RESPONSE &&
+        total == MB_REQ_LEN && memcmp(rx, req, MB_REQ_LEN) == 0)
+    {
+        *echo_only = true;                  /* only our own request came back */
+        return ESP_ERR_TIMEOUT;
+    }
+    return result;
 }
 
-static void log_failure(esp_err_t err, const uint8_t *rx, int rx_len, uint32_t fails)
+static void log_failure(esp_err_t err, const uint8_t *rx, int rx_len, bool echo_only, uint32_t fails)
 {
+    if (echo_only)
+    {
+        ESP_LOGW(TAG, "Only the echo of our own request came back, no answer within %d ms (failed polls: %lu) - "
+                      "the request reaches the bus but the BMS does not reply: check A/B swap, GND to the "
+                      "BMS RS485 port, BMS port/protocol and address", CONFIG_APP_BMS_RESPONSE_TIMEOUT_MS,
+                 (unsigned long)fails);
+        return;
+    }
     if (err == ESP_ERR_TIMEOUT)
     {
         ESP_LOGW(TAG, "No answer within %d ms (failed polls: %lu) - check wiring (TX2/RX2 swap, A/B swap), "
@@ -255,7 +321,8 @@ static void bms_task(void *arg)
     {
         uint16_t reg = 0;
         int rx_len = 0;
-        esp_err_t err = read_holding_register(req, slave, &reg, rx, &rx_len);
+        bool echo_only = false;
+        esp_err_t err = read_holding_register(req, slave, &reg, rx, &rx_len, &echo_only);
         if (err == ESP_OK)
         {
             int soc = (reg & mask) >> shift;
@@ -286,7 +353,7 @@ static void bms_task(void *arg)
             /* Log the first failure, the moment the SoC goes stale, then once a minute */
             if (fails == 1 || fails == BMS_STALE_POLLS || (fails % BMS_REPEAT_LOG_POLLS) == 0)
             {
-                log_failure(err, rx, rx_len, fails);
+                log_failure(err, rx, rx_len, echo_only, fails);
             }
             if (fails == BMS_STALE_POLLS)
             {
